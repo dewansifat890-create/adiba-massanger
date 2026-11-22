@@ -256,7 +256,7 @@ export function NoteEditor({
       onClick={closeAllMenus}
     >
       {/* Top Bar matching Screenshot 3: [ < ] ... [ ↑ | ••• ] [ ✓ ] */}
-      <header className="sticky top-0 z-30 h-[60px] px-4 flex items-center justify-between gap-3 bg-[#f2f2f7]/90 dark:bg-black/90 backdrop-blur-xl">
+      <header className="sticky top-0 z-30 min-h-[calc(60px+env(safe-area-inset-top))] pt-[env(safe-area-inset-top)] px-4 flex items-center justify-between gap-3 bg-[#f2f2f7]/90 dark:bg-black/90 backdrop-blur-xl">
         <button
           type="button"
           onClick={onBack}
@@ -585,7 +585,7 @@ export function NoteEditor({
                     }
                   }}
                   placeholder="Add item…"
-                  className={`${fontClass} flex-1 bg-transparent py-2 text-[15px] text-slate-800 dark:text-white placeholder:text-slate-400 dark:placeholder:text-zinc-600 focus:outline-none caret-[#E5A91A]`}
+                  className={`${fontClass} flex-1 bg-transparent py-2 text-base sm:text-[15px] text-slate-800 dark:text-white placeholder:text-slate-400 dark:placeholder:text-zinc-600 focus:outline-none caret-[#E5A91A]`}
                 />
                 {newTaskText.trim() && (
                   <button
@@ -618,7 +618,7 @@ export function NoteEditor({
         <div
           className={`${
             isMobileFrame ? 'sticky bottom-0' : 'fixed bottom-0 left-0 right-0'
-          } z-30 px-4 pb-4 pt-2 bg-gradient-to-t from-[#f2f2f7] via-[#f2f2f7]/90 to-transparent dark:from-black dark:via-black/90`}
+          } z-30 px-4 pb-[max(16px,env(safe-area-inset-bottom))] pt-2 bg-gradient-to-t from-[#f2f2f7] via-[#f2f2f7]/90 to-transparent dark:from-black dark:via-black/90`}
           onClick={(e) => e.stopPropagation()}
         >
           {/* Popover above pill */}

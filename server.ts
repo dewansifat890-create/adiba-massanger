@@ -39,6 +39,8 @@ interface DirectMessage {
   createdAt: number;
   deliveredAt?: number;
   seenAt?: number;
+  unsent?: boolean;
+  unsentAt?: number;
   replyTo?: ChatReplyPreview;
   reactions?: ChatReaction[];
 }
@@ -97,15 +99,7 @@ function makeDmId(userA: string, userB: string): string {
 }
 
 loadFromDisk();
-
-if (!users.has('demo-user')) {
-  users.set('demo-user', {
-    userId: 'demo-user',
-    handle: 'demo-user',
-    displayName: 'Demo Friend',
-    updatedAt: Date.now(),
-  });
-}
+users.delete('demo-user');
 
 async function startServer() {
   const app = express();
@@ -267,12 +261,17 @@ self.addEventListener('notificationclick', function (event) {
           body: 'You have a new note reminder',
         },
         webpush: {
+          headers: {
+            Urgency: 'high',
+            TTL: '86400',
+          },
           notification: {
             title: 'NotePad',
             body: 'You have a new note reminder',
             icon: '/pwa-192x192.png',
             badge: '/pwa-192x192.png',
             tag: 'notepad-reminder',
+            renotify: true,
           },
           fcmOptions: {
             link: '/',
@@ -594,14 +593,18 @@ self.addEventListener('notificationclick', function (event) {
         if (!dmId || !messageId) return;
 
         const list = dms.get(dmId) ?? [];
-        const nextList = list.filter((m) => m.id !== messageId);
-        if (nextList.length === list.length) return;
-        dms.set(dmId, nextList);
+        const target = list.find((m) => m.id === messageId);
+        if (!target || target.fromUserId !== meta.userId) return;
+        target.text = '';
+        target.unsent = true;
+        target.unsentAt = Date.now();
+        delete target.replyTo;
+        target.reactions = [];
         saveToDisk();
 
         const [u1, u2] = dmId.split('__');
-        if (u1) sendToUser(u1, { type: 'dm:deleted', dmId, messageId });
-        if (u2 && u2 !== u1) sendToUser(u2, { type: 'dm:deleted', dmId, messageId });
+        if (u1) sendToUser(u1, { type: 'dm:updated', dmId, message: target });
+        if (u2 && u2 !== u1) sendToUser(u2, { type: 'dm:updated', dmId, message: target });
         return;
       }
 

@@ -75,7 +75,7 @@ export function FoldersView({
   return (
     <div className="flex-1 flex flex-col">
       {/* Top Floating Circular Action Buttons */}
-      <header className="px-4 pt-3 pb-1 flex items-center justify-between gap-3">
+      <header className="px-4 pt-[max(12px,env(safe-area-inset-top))] pb-1 flex items-center justify-between gap-3">
         <button
           type="button"
           onClick={onOpenSettings}

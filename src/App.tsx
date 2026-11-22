@@ -71,50 +71,8 @@ const FOLDERS_STORAGE_KEY = 'notepad_smart_folders_v2';
 const MESSENGER_USER_KEY = 'notepad_messenger_user_v1';
 const MESSENGER_CONTACTS_KEY = 'notepad_messenger_contacts_v1';
 const MESSENGER_CONVS_KEY = 'notepad_messenger_convs_v1';
-const MESSENGER_DEMO_SEEDED_KEY = 'notepad_messenger_demo_v1';
-
-const DEMO_CONTACT: MessengerUser = {
-  userId: 'demo-user',
-  handle: 'demo-user',
-  displayName: 'Demo Friend',
-};
-
-function createDemoMessages(myUserId: string, myName: string): DirectMessage[] {
-  const dmId = makeDmId(myUserId, DEMO_CONTACT.userId);
-  const now = Date.now();
-  return [
-    {
-      id: 'demo-msg-1',
-      dmId,
-      fromUserId: DEMO_CONTACT.userId,
-      toUserId: myUserId,
-      senderName: DEMO_CONTACT.displayName,
-      text: 'Hey! Ei hidden Messenger window-te tumi free-te chat test korte parbe.',
-      createdAt: now - 1000 * 60 * 12,
-      reactions: [{ emoji: '👍', userIds: [myUserId] }],
-    },
-    {
-      id: 'demo-msg-2',
-      dmId,
-      fromUserId: myUserId,
-      toUserId: DEMO_CONTACT.userId,
-      senderName: myName,
-      text: 'Nice! Message asle "You have a new note reminder" notification dekhabe.',
-      createdAt: now - 1000 * 60 * 6,
-      reactions: [],
-    },
-    {
-      id: 'demo-msg-3',
-      dmId,
-      fromUserId: DEMO_CONTACT.userId,
-      toUserId: myUserId,
-      senderName: DEMO_CONTACT.displayName,
-      text: 'Ekdom! Message-e tap kore reply, react ba delete kore dekho, ar uporer Hide button-e click korle Notes-e chole jabe.',
-      createdAt: now - 1000 * 60 * 2,
-      reactions: [],
-    },
-  ];
-}
+const NOTIF_PROMPT_DONE_KEY = 'notepad_notif_prompt_done_v1';
+const LEGACY_DEMO_USER_ID = 'demo-user';
 
 function loadNotes(): Note[] {
   try {
@@ -176,7 +134,15 @@ function loadOrCreateMessengerUser(): MessengerUser {
 function loadContacts(): MessengerUser[] {
   try {
     const raw = localStorage.getItem(MESSENGER_CONTACTS_KEY);
-    return raw ? (JSON.parse(raw) as MessengerUser[]) : [];
+    const list = raw ? (JSON.parse(raw) as MessengerUser[]) : [];
+    return Array.isArray(list)
+      ? list.filter(
+          (c) =>
+            c &&
+            c.userId !== LEGACY_DEMO_USER_ID &&
+            c.handle !== LEGACY_DEMO_USER_ID
+        )
+      : [];
   } catch {
     return [];
   }
@@ -185,7 +151,14 @@ function loadContacts(): MessengerUser[] {
 function loadConversations(): Record<string, DirectMessage[]> {
   try {
     const raw = localStorage.getItem(MESSENGER_CONVS_KEY);
-    return raw ? (JSON.parse(raw) as Record<string, DirectMessage[]>) : {};
+    const parsed = raw ? (JSON.parse(raw) as Record<string, DirectMessage[]>) : {};
+    if (!parsed || typeof parsed !== 'object') return {};
+    const cleaned: Record<string, DirectMessage[]> = {};
+    for (const [dmId, msgs] of Object.entries(parsed)) {
+      if (dmId.split('__').includes(LEGACY_DEMO_USER_ID)) continue;
+      if (Array.isArray(msgs)) cleaned[dmId] = msgs;
+    }
+    return cleaned;
   } catch {
     return {};
   }
@@ -216,7 +189,7 @@ export default function App() {
   const [conversations, setConversations] =
     useState<Record<string, DirectMessage[]>>(loadConversations);
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
-  const [onlineUserIds, setOnlineUserIds] = useState<string[]>([DEMO_CONTACT.userId]);
+  const [onlineUserIds, setOnlineUserIds] = useState<string[]>([]);
   const [peerLastSeen, setPeerLastSeen] = useState<Record<string, number>>({});
   const [chatReceipts, setChatReceipts] = useState<
     Record<string, { deliveredAt: number; seenAt: number }>
@@ -238,7 +211,18 @@ export default function App() {
     return typeof Notification !== 'undefined' && Notification.permission === 'granted';
   });
   const [showNotifPrompt, setShowNotifPrompt] = useState<boolean>(() => {
-    return typeof Notification !== 'undefined' && Notification.permission === 'default';
+    try {
+      if (localStorage.getItem(NOTIF_PROMPT_DONE_KEY) === '1') {
+        return false;
+      }
+      if (typeof Notification !== 'undefined' && Notification.permission !== 'default') {
+        localStorage.setItem(NOTIF_PROMPT_DONE_KEY, '1');
+        return false;
+      }
+    } catch {
+      // Ignore storage errors
+    }
+    return true;
   });
   const [reminderBannerVisible, setReminderBannerVisible] = useState(false);
 
@@ -246,6 +230,7 @@ export default function App() {
   const knownFirebaseChatsRef = useRef<Set<string>>(new Set());
   const deliveredMarkRef = useRef<Record<string, number>>({});
   const seenMarkRef = useRef<Record<string, number>>({});
+  const fcmTokenSavedRef = useRef<string | null>(null);
   const screenRef = useRef<AppScreen>(screen);
   const activeChatPeerRef = useRef<string | null>(activeChatPeerId);
   const notificationsEnabledRef = useRef<boolean>(notificationsEnabled);
@@ -318,29 +303,7 @@ export default function App() {
     }
   }, [conversations]);
 
-  // Seed 1 demo chatting user once so Messenger has a ready-to-preview conversation
-  useEffect(() => {
-    try {
-      if (localStorage.getItem(MESSENGER_DEMO_SEEDED_KEY)) return;
-      localStorage.setItem(MESSENGER_DEMO_SEEDED_KEY, '1');
-    } catch {
-      // Continue seeding in memory if storage is blocked
-    }
-
-    setContacts((prev) => {
-      if (prev.some((c) => c.userId === DEMO_CONTACT.userId)) return prev;
-      return [...prev, DEMO_CONTACT];
-    });
-
-    const dmId = makeDmId(messengerUser.userId, DEMO_CONTACT.userId);
-    setConversations((prev) => {
-      if (prev[dmId] && prev[dmId].length > 0) return prev;
-      return {
-        ...prev,
-        [dmId]: createDemoMessages(messengerUser.userId, messengerUser.displayName),
-      };
-    });
-  }, [messengerUser.userId, messengerUser.displayName]);
+  // Persist conversations
 
   // Sync theme with <html class="dark">
   useEffect(() => {
@@ -468,22 +431,6 @@ export default function App() {
         );
         if (cancelled) return;
 
-        // Migrate any local demo-user thread to the Firebase UID key
-        setConversations((prev) => {
-          const oldId = currentStored.userId;
-          if (oldId === synced.userId) return prev;
-          const oldDemoKey = makeDmId(oldId, DEMO_CONTACT.userId);
-          const newDemoKey = makeDmId(synced.userId, DEMO_CONTACT.userId);
-          if (!prev[oldDemoKey] || prev[newDemoKey]) return prev;
-          const migrated = prev[oldDemoKey].map((m) => ({
-            ...m,
-            dmId: newDemoKey,
-            fromUserId: m.fromUserId === oldId ? synced.userId : m.fromUserId,
-            toUserId: m.toUserId === oldId ? synced.userId : m.toUserId,
-          }));
-          return { ...prev, [newDemoKey]: migrated };
-        });
-
         setMessengerUser(synced);
         setFirebaseStatus('ready');
         unsubPresence = startFirebasePresence(fbUser.uid);
@@ -492,7 +439,9 @@ export default function App() {
           typeof Notification !== 'undefined' &&
           Notification.permission === 'granted'
         ) {
-          void registerFirebasePushNotifications(fbUser.uid);
+          void registerFirebasePushNotifications(fbUser.uid).then((r) => {
+            if (r.token) fcmTokenSavedRef.current = fbUser.uid;
+          });
         }
 
         unsubChats = subscribeToFirebaseChats(fbUser.uid, {
@@ -512,7 +461,6 @@ export default function App() {
                 const next = new Set(prev);
                 if (peer.isOnline) next.add(peer.userId);
                 else next.delete(peer.userId);
-                next.add(DEMO_CONTACT.userId);
                 return Array.from(next);
               });
             }
@@ -593,6 +541,11 @@ export default function App() {
           onKnownChatsChange: (chatIds) => {
             knownFirebaseChatsRef.current = chatIds;
           },
+          onRecovered: () => {
+            if (!cancelled) {
+              setFirebaseStatus('ready');
+            }
+          },
           onError: (err) => {
             const msg = err.message || '';
             if (msg.toLowerCase().includes('permission')) {
@@ -617,19 +570,77 @@ export default function App() {
     };
   }, []);
 
+  // Ensure FCM background push token is registered & saved as soon as Firebase + permission are both ready
+  useEffect(() => {
+    if (firebaseStatus !== 'ready' || !auth?.currentUser) return;
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') {
+      return;
+    }
+    const uid = auth.currentUser.uid;
+    if (fcmTokenSavedRef.current === uid) return;
+
+    let cancelled = false;
+    const tryRegisterFcm = () => {
+      if (cancelled || fcmTokenSavedRef.current === uid) return;
+      void registerFirebasePushNotifications(uid).then((res) => {
+        if (!cancelled && res.token) {
+          fcmTokenSavedRef.current = uid;
+        }
+      });
+    };
+
+    tryRegisterFcm();
+    const retryTimer = window.setTimeout(tryRegisterFcm, 3000);
+    window.addEventListener('focus', tryRegisterFcm);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(retryTimer);
+      window.removeEventListener('focus', tryRegisterFcm);
+    };
+  }, [firebaseStatus, notificationsEnabled]);
+
+  // Auto-recover if a transient permission-denied happened before rules propagated or after sleep
+  useEffect(() => {
+    if (firebaseStatus !== 'permission-denied' || !auth?.currentUser) return;
+    const attemptRecover = () => {
+      const fbUser = auth?.currentUser;
+      if (!fbUser || !navigator.onLine) return;
+      const stored = loadOrCreateMessengerUser();
+      void fbUser
+        .getIdToken(true)
+        .then(() =>
+          syncFirebaseUserProfile(fbUser.uid, stored.displayName, stored.handle)
+        )
+        .then((synced) => {
+          setMessengerUser(synced);
+          setFirebaseStatus('ready');
+        })
+        .catch(() => {
+          // Keep status until rules are available
+        });
+    };
+    const timer = window.setTimeout(attemptRecover, 2000);
+    window.addEventListener('focus', attemptRecover);
+    window.addEventListener('online', attemptRecover);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('focus', attemptRecover);
+      window.removeEventListener('online', attemptRecover);
+    };
+  }, [firebaseStatus]);
+
   // Subscribe to real-time presence + lastSeen for every non-demo contact
   useEffect(() => {
     if (firebaseStatus !== 'ready') return;
     const unsubs: (() => void)[] = [];
     for (const c of contacts) {
-      if (!c.userId || c.userId === DEMO_CONTACT.userId) continue;
+      if (!c.userId) continue;
       unsubs.push(
         subscribeToPeerPresence(c.userId, ({ isOnline, lastSeen }) => {
           setOnlineUserIds((prev) => {
             const next = new Set(prev);
             if (isOnline) next.add(c.userId);
             else next.delete(c.userId);
-            next.add(DEMO_CONTACT.userId);
             return Array.from(next);
           });
           if (typeof lastSeen === 'number') {
@@ -646,7 +657,6 @@ export default function App() {
   // Mark active chat messages as seen immediately when viewing thread or returning to tab
   useEffect(() => {
     if (screen.type !== 'messenger' || !activeChatPeerId) return;
-    if (activeChatPeerId === DEMO_CONTACT.userId) return;
 
     const markVisibleSeen = () => {
       if (document.visibilityState !== 'visible' || !navigator.onLine) return;
@@ -748,12 +758,10 @@ export default function App() {
             }
           } else if (data.type === 'presence:list' && Array.isArray(data.onlineUserIds)) {
             if (firebaseStatus !== 'ready') {
-              const list = data.onlineUserIds as string[];
-              setOnlineUserIds(
-                list.includes(DEMO_CONTACT.userId)
-                  ? list
-                  : [DEMO_CONTACT.userId, ...list]
+              const list = (data.onlineUserIds as string[]).filter(
+                (id) => id !== LEGACY_DEMO_USER_ID
               );
+              setOnlineUserIds(list);
               if (data.lastSeenMap && typeof data.lastSeenMap === 'object') {
                 setPeerLastSeen((prev) => ({
                   ...prev,
@@ -848,8 +856,17 @@ export default function App() {
           } else if (data.type === 'dm:deleted' && data.dmId && data.messageId) {
             setConversations((prev) => ({
               ...prev,
-              [data.dmId]: (prev[data.dmId] ?? []).filter(
-                (m) => m.id !== data.messageId
+              [data.dmId]: (prev[data.dmId] ?? []).map((m) =>
+                m.id === data.messageId
+                  ? {
+                      ...m,
+                      text: '',
+                      unsent: true,
+                      unsentAt: Date.now(),
+                      replyTo: undefined,
+                      reactions: [],
+                    }
+                  : m
               ),
             }));
           } else if (data.type === 'dm:typing' && data.fromUserId) {
@@ -1153,6 +1170,12 @@ export default function App() {
 
   // Messenger handlers
   const handleToggleNotifications = async () => {
+    try {
+      localStorage.setItem(NOTIF_PROMPT_DONE_KEY, '1');
+    } catch {
+      // Ignore storage error
+    }
+
     if (typeof Notification === 'undefined') {
       showToast('Browser notifications are not supported here');
       return;
@@ -1164,9 +1187,13 @@ export default function App() {
     }
 
     if (firebaseStatus === 'ready' && auth?.currentUser) {
-      const result = await registerFirebasePushNotifications(auth.currentUser.uid);
+      const uid = auth.currentUser.uid;
+      const result = await registerFirebasePushNotifications(uid);
       if (result.ok) {
         setNotificationsEnabled(true);
+        if (result.token) {
+          fcmTokenSavedRef.current = uid;
+        }
         showToast(
           result.token
             ? 'Push reminders active'
@@ -1184,6 +1211,12 @@ export default function App() {
     const perm = await Notification.requestPermission();
     if (perm === 'granted') {
       setNotificationsEnabled(true);
+      if (auth?.currentUser) {
+        const uid = auth.currentUser.uid;
+        void registerFirebasePushNotifications(uid).then((res) => {
+          if (res.token) fcmTokenSavedRef.current = uid;
+        });
+      }
       showToast('Disguised notifications enabled');
     } else {
       setNotificationsEnabled(false);
@@ -1405,9 +1438,8 @@ export default function App() {
             }));
 
             if (
-              firebaseStatus === 'ready' &&
               auth?.currentUser &&
-              toUserId !== DEMO_CONTACT.userId
+              (firebaseStatus === 'ready' || firebaseStatus === 'permission-denied')
             ) {
               void sendFirebaseDirectMessage({
                 myUid: auth.currentUser.uid,
@@ -1417,9 +1449,17 @@ export default function App() {
                 messageId,
                 replyTo,
                 chatAlreadyExists: knownFirebaseChatsRef.current.has(dmId),
-              }).catch(() => {
-                showToast('Failed to send via Firebase');
-              });
+              })
+                .then(() => {
+                  setFirebaseStatus('ready');
+                })
+                .catch((err) => {
+                  const msg = err instanceof Error ? err.message : '';
+                  if (msg.toLowerCase().includes('permission')) {
+                    setFirebaseStatus('permission-denied');
+                  }
+                  showToast('Failed to send via Firebase');
+                });
               return;
             }
 
@@ -1462,11 +1502,7 @@ export default function App() {
               }),
             }));
 
-            if (
-              firebaseStatus === 'ready' &&
-              auth?.currentUser &&
-              !dmId.includes(DEMO_CONTACT.userId)
-            ) {
+            if (firebaseStatus === 'ready' && auth?.currentUser) {
               void toggleFirebaseMessageReaction(
                 auth.currentUser.uid,
                 dmId,
@@ -1491,18 +1527,26 @@ export default function App() {
             }
           }}
           onDeleteMessage={(dmId, messageId) => {
+            const now = Date.now();
             setConversations((prev) => ({
               ...prev,
-              [dmId]: (prev[dmId] ?? []).filter((m) => m.id !== messageId),
+              [dmId]: (prev[dmId] ?? []).map((m) =>
+                m.id === messageId
+                  ? {
+                      ...m,
+                      text: '',
+                      unsent: true,
+                      unsentAt: now,
+                      replyTo: undefined,
+                      reactions: [],
+                    }
+                  : m
+              ),
             }));
 
-            if (
-              firebaseStatus === 'ready' &&
-              auth?.currentUser &&
-              !dmId.includes(DEMO_CONTACT.userId)
-            ) {
+            if (firebaseStatus === 'ready' && auth?.currentUser) {
               void deleteFirebaseDirectMessage(dmId, messageId).catch(() => {
-                showToast('Only the sender can delete this message');
+                showToast('Only the sender can unsend this message');
               });
               return;
             }
@@ -1518,11 +1562,7 @@ export default function App() {
             }
           }}
           onTyping={(toUserId, isTyping) => {
-            if (
-              firebaseStatus === 'ready' &&
-              auth?.currentUser &&
-              toUserId !== DEMO_CONTACT.userId
-            ) {
+            if (firebaseStatus === 'ready' && auth?.currentUser) {
               void sendFirebaseTypingStatus(
                 auth.currentUser.uid,
                 toUserId,
@@ -1644,7 +1684,7 @@ export default function App() {
           className="flex-1 flex flex-col"
           onClick={() => setShowFolderMenu(false)}
         >
-          <header className="sticky top-0 z-30 h-[60px] px-4 flex items-center justify-between gap-2 bg-[#f2f2f7]/90 dark:bg-black/90 backdrop-blur-xl">
+          <header className="sticky top-0 z-30 min-h-[calc(60px+env(safe-area-inset-top))] pt-[env(safe-area-inset-top)] px-4 flex items-center justify-between gap-2 bg-[#f2f2f7]/90 dark:bg-black/90 backdrop-blur-xl">
             <button
               type="button"
               onClick={() => {
@@ -1873,20 +1913,23 @@ export default function App() {
         <div
           className={`${
             isMobileFrame ? 'absolute' : 'fixed'
-          } inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4`}
-          onClick={() => setShowNotifPrompt(false)}
+          } inset-0 z-50 flex items-center justify-center bg-black/55 backdrop-blur-md p-4`}
           role="dialog"
           aria-modal="true"
           aria-label="Allow Notification"
         >
           <button
             type="button"
-            onClick={(e) => {
-              e.stopPropagation();
+            onClick={() => {
+              try {
+                localStorage.setItem(NOTIF_PROMPT_DONE_KEY, '1');
+              } catch {
+                // Ignore storage error
+              }
               setShowNotifPrompt(false);
               void handleToggleNotifications();
             }}
-            className={`min-h-[50px] px-7 rounded-full shadow-2xl text-[15px] font-semibold flex items-center gap-2.5 transition-transform active:scale-95 text-white dark:text-black ${accentStyle.bg}`}
+            className={`min-h-[52px] px-7 rounded-full shadow-2xl text-[15px] font-semibold flex items-center gap-2.5 transition-transform active:scale-95 text-white dark:text-black ${accentStyle.bg}`}
           >
             <Bell className="w-4 h-4" />
             <span>Allow Notification</span>

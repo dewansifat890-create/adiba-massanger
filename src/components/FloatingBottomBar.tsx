@@ -89,7 +89,7 @@ export function FloatingBottomBar({
     <div
       className={`${
         isMobileFrame ? 'sticky bottom-0' : 'fixed bottom-0 left-0 right-0'
-      } z-30 pointer-events-none px-4 pb-4 pt-2 bg-gradient-to-t from-[#f2f2f7] via-[#f2f2f7]/90 to-transparent dark:from-black dark:via-black/90`}
+      } z-30 pointer-events-none px-4 pb-[max(16px,env(safe-area-inset-bottom))] pt-2 bg-gradient-to-t from-[#f2f2f7] via-[#f2f2f7]/90 to-transparent dark:from-black dark:via-black/90`}
     >
       <div
         className={`mx-auto flex items-center gap-2.5 pointer-events-auto ${
@@ -105,7 +105,7 @@ export function FloatingBottomBar({
             onChange={(e) => onSearchChange(e.target.value)}
             placeholder="Search"
             aria-label="Search notes"
-            className="flex-1 min-w-0 bg-transparent text-[15px] text-slate-900 dark:text-white placeholder:text-slate-400 dark:placeholder:text-zinc-500 focus:outline-none"
+            className="flex-1 min-w-0 bg-transparent text-base sm:text-[15px] text-slate-900 dark:text-white placeholder:text-slate-400 dark:placeholder:text-zinc-500 focus:outline-none"
           />
           {searchQuery ? (
             <button

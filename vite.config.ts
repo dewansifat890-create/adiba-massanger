@@ -13,7 +13,7 @@ export default defineConfig(() => {
       VitePWA({
         registerType: 'prompt',
         includeAssets: [
-          'icon.svg',
+          'favicon.ico',
           'apple-touch-icon.png',
           'pwa-192x192.png',
           'pwa-512x512.png',
@@ -52,6 +52,7 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
+          importScripts: ['/firebase-messaging-sw.js'],
           cleanupOutdatedCaches: true,
           maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],

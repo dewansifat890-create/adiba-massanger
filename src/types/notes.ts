@@ -79,6 +79,8 @@ export interface DirectMessage {
   createdAt: number;
   deliveredAt?: number;
   seenAt?: number;
+  unsent?: boolean;
+  unsentAt?: number;
   replyTo?: ChatReplyPreview;
   reactions?: ChatReaction[];
 }

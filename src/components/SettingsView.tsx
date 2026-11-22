@@ -155,7 +155,7 @@ export function SettingsView({
   return (
     <div className="flex-1 flex flex-col">
       {/* Top Bar */}
-      <header className="sticky top-0 z-30 h-[56px] px-3 flex items-center justify-between bg-[#f2f2f7]/90 dark:bg-black/90 backdrop-blur-xl">
+      <header className="sticky top-0 z-30 min-h-[calc(56px+env(safe-area-inset-top))] pt-[env(safe-area-inset-top)] px-3 flex items-center justify-between bg-[#f2f2f7]/90 dark:bg-black/90 backdrop-blur-xl">
         <button
           type="button"
           onClick={onBack}

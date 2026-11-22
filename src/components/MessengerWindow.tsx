@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowUp,
+  Ban,
   Bell,
   BellRing,
   Check,
@@ -12,6 +13,7 @@ import {
   Mic,
   Plus,
   Reply,
+  RotateCcw,
   Search,
   Trash2,
   User,
@@ -198,6 +200,30 @@ export function MessengerWindow({
   const typingTimeoutRef = useRef<number | null>(null);
   const lastTypingPingRef = useRef<number>(0);
   const isTypingSentRef = useRef(false);
+  const longPressTimerRef = useRef<number | null>(null);
+  const longPressOriginRef = useRef<{ x: number; y: number } | null>(null);
+  const modalOpenedAtRef = useRef<number>(0);
+
+  const openGlassMenu = (msgId: string) => {
+    modalOpenedAtRef.current = Date.now();
+    setSelectedMsgId(msgId);
+  };
+
+  const clearLongPress = () => {
+    if (longPressTimerRef.current !== null) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+    longPressOriginRef.current = null;
+  };
+
+  useEffect(() => {
+    return () => {
+      if (longPressTimerRef.current !== null) {
+        window.clearTimeout(longPressTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowTick(Date.now()), 5000);
@@ -511,7 +537,7 @@ export function MessengerWindow({
         onClick={() => setSelectedMsgId(null)}
       >
         {/* Messenger Header */}
-        <header className="shrink-0 z-30 min-h-[62px] pt-[env(safe-area-inset-top)] px-3 flex items-center justify-between gap-2 bg-white/95 dark:bg-[#111113]/95 backdrop-blur-xl border-b border-slate-200/80 dark:border-white/[0.08] touch-none">
+        <header className="shrink-0 z-30 min-h-[calc(62px+env(safe-area-inset-top))] pt-[env(safe-area-inset-top)] px-3 flex items-center justify-between gap-2 bg-white/95 dark:bg-[#111113]/95 backdrop-blur-xl border-b border-slate-200/80 dark:border-white/[0.08] touch-none">
           <div className="flex items-center gap-2 min-w-0 py-2">
             <button
               type="button"
@@ -608,14 +634,17 @@ export function MessengerWindow({
 
                   {group.items.map((msg) => {
                     const isMine = msg.fromUserId === currentUser.userId;
-                    const isSelected = selectedMsgId === msg.id;
+                    const isUnsent = Boolean(msg.unsent);
+                    const isSelected = selectedMsgId === msg.id && !isUnsent;
                     const isMsgSeen = Boolean(
                       isMine &&
+                        !isUnsent &&
                         (msg.seenAt ||
                           (activeReceipt && activeReceipt.seenAt >= msg.createdAt))
                     );
                     const isMsgDelivered = Boolean(
                       isMine &&
+                        !isUnsent &&
                         (isMsgSeen ||
                           msg.deliveredAt ||
                           (activeReceipt && activeReceipt.deliveredAt >= msg.createdAt) ||
@@ -625,66 +654,120 @@ export function MessengerWindow({
                     return (
                       <div
                         key={msg.id}
-                        className={`flex flex-col ${isMine ? 'items-end' : 'items-start'}`}
-                        onClick={(e) => {
+                        className={`flex flex-col select-none [-webkit-touch-callout:none] ${
+                          isMine ? 'items-end' : 'items-start'
+                        }`}
+                        onPointerDown={(e) => {
+                          if (isUnsent) return;
                           e.stopPropagation();
-                          setSelectedMsgId((prev) => (prev === msg.id ? null : msg.id));
+                          clearLongPress();
+                          longPressOriginRef.current = { x: e.clientX, y: e.clientY };
+                          longPressTimerRef.current = window.setTimeout(() => {
+                            longPressTimerRef.current = null;
+                            openGlassMenu(msg.id);
+                            try {
+                              navigator.vibrate?.(12);
+                            } catch {
+                              // Ignore haptic error
+                            }
+                          }, 380);
+                        }}
+                        onPointerMove={(e) => {
+                          const origin = longPressOriginRef.current;
+                          if (!origin) return;
+                          if (
+                            Math.abs(e.clientX - origin.x) > 8 ||
+                            Math.abs(e.clientY - origin.y) > 8
+                          ) {
+                            clearLongPress();
+                          }
+                        }}
+                        onPointerUp={clearLongPress}
+                        onPointerCancel={clearLongPress}
+                        onContextMenu={(e) => {
+                          if (isUnsent) return;
+                          e.preventDefault();
+                          e.stopPropagation();
+                          clearLongPress();
+                          openGlassMenu(msg.id);
                         }}
                       >
-                        <div
-                          className={`max-w-[80%] sm:max-w-[68%] px-3.5 py-2.5 rounded-2xl transition-colors ${
-                            isMine
-                              ? 'bg-blue-600 text-white rounded-br-md'
-                              : 'bg-white dark:bg-[#1C1C1E] border border-slate-200/80 dark:border-white/[0.08] text-slate-900 dark:text-white rounded-bl-md'
-                          }`}
-                        >
-                          {msg.replyTo && (
-                            <div
-                              className={`mb-1.5 px-2.5 py-1.5 rounded-xl text-xs ${
-                                isMine
-                                  ? 'bg-white/15 text-white'
-                                  : 'bg-slate-100 dark:bg-white/[0.06] text-slate-700 dark:text-zinc-300'
-                              }`}
-                            >
-                              <div className="font-semibold">{msg.replyTo.senderName}</div>
-                              <div className="truncate opacity-90">{msg.replyTo.text}</div>
-                            </div>
-                          )}
-
-                          <p
-                            className={`${fontClass} text-[15px] leading-relaxed whitespace-pre-wrap break-words`}
-                          >
-                            {msg.text}
-                          </p>
-
+                        {isUnsent ? (
                           <div
-                            className={`mt-1 flex items-center justify-end gap-1 text-[10px] tabular-nums ${
-                              isMine ? 'text-blue-100' : 'text-slate-400 dark:text-zinc-500'
+                            className={`max-w-[80%] sm:max-w-[68%] px-3.5 py-2 rounded-2xl border backdrop-blur-xs ${
+                              isMine
+                                ? 'bg-slate-200/70 dark:bg-white/[0.06] border-slate-300/60 dark:border-white/[0.08] text-slate-500 dark:text-zinc-400 rounded-br-md'
+                                : 'bg-white/70 dark:bg-[#1C1C1E]/70 border-slate-200/80 dark:border-white/[0.08] text-slate-500 dark:text-zinc-400 rounded-bl-md'
                             }`}
                           >
-                            <span>{formatMessageTime(msg.createdAt)}</span>
-                            {isMine &&
-                              (isMsgSeen ? (
-                                msg.id === lastSeenOutgoingId ? (
-                                  <span className="font-semibold text-blue-100">
-                                    · Seen
-                                  </span>
-                                ) : null
-                              ) : isMsgDelivered ? (
-                                <CheckCheck
-                                  className="w-3.5 h-3.5 text-sky-200"
-                                  aria-label="Delivered"
-                                />
-                              ) : (
-                                <Check
-                                  className="w-3 h-3 text-blue-100/85"
-                                  aria-label="Sent"
-                                />
-                              ))}
+                            <div className="flex items-center gap-1.5 text-[13px] italic">
+                              <Ban className="w-3.5 h-3.5 shrink-0 opacity-75" />
+                              <span>
+                                {isMine ? 'You unsent a message' : 'This message was deleted'}
+                              </span>
+                            </div>
+                            <div className="mt-0.5 flex items-center justify-end text-[10px] tabular-nums opacity-70">
+                              <span>{formatMessageTime(msg.createdAt)}</span>
+                            </div>
                           </div>
-                        </div>
+                        ) : (
+                          <div
+                            className={`max-w-[80%] sm:max-w-[68%] px-3.5 py-2.5 rounded-2xl transition-transform duration-150 ${
+                              isSelected ? 'scale-[0.98]' : ''
+                            } ${
+                              isMine
+                                ? 'bg-blue-600 text-white rounded-br-md'
+                                : 'bg-white dark:bg-[#1C1C1E] border border-slate-200/80 dark:border-white/[0.08] text-slate-900 dark:text-white rounded-bl-md'
+                            }`}
+                          >
+                            {msg.replyTo && (
+                              <div
+                                className={`mb-1.5 px-2.5 py-1.5 rounded-xl text-xs ${
+                                  isMine
+                                    ? 'bg-white/15 text-white'
+                                    : 'bg-slate-100 dark:bg-white/[0.06] text-slate-700 dark:text-zinc-300'
+                                }`}
+                              >
+                                <div className="font-semibold">{msg.replyTo.senderName}</div>
+                                <div className="truncate opacity-90">{msg.replyTo.text}</div>
+                              </div>
+                            )}
 
-                        {msg.reactions && msg.reactions.length > 0 && (
+                            <p
+                              className={`${fontClass} text-[15px] leading-relaxed whitespace-pre-wrap break-words`}
+                            >
+                              {msg.text}
+                            </p>
+
+                            <div
+                              className={`mt-1 flex items-center justify-end gap-1 text-[10px] tabular-nums ${
+                                isMine ? 'text-blue-100' : 'text-slate-400 dark:text-zinc-500'
+                              }`}
+                            >
+                              <span>{formatMessageTime(msg.createdAt)}</span>
+                              {isMine &&
+                                (isMsgSeen ? (
+                                  msg.id === lastSeenOutgoingId ? (
+                                    <span className="font-semibold text-blue-100">
+                                      · Seen
+                                    </span>
+                                  ) : null
+                                ) : isMsgDelivered ? (
+                                  <CheckCheck
+                                    className="w-3.5 h-3.5 text-sky-200"
+                                    aria-label="Delivered"
+                                  />
+                                ) : (
+                                  <Check
+                                    className="w-3 h-3 text-blue-100/85"
+                                    aria-label="Sent"
+                                  />
+                                ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {!isUnsent && msg.reactions && msg.reactions.length > 0 && (
                           <div className="flex items-center gap-1 mt-1 px-1">
                             {msg.reactions.map((r) => (
                               <button
@@ -708,71 +791,6 @@ export function MessengerWindow({
                                 )}
                               </button>
                             ))}
-                          </div>
-                        )}
-
-                        {isSelected && (
-                          <div
-                            className="mt-1.5 p-1 rounded-full bg-white dark:bg-[#1C1C1E] border border-slate-200 dark:border-white/[0.1] shadow-xl flex items-center gap-0.5 z-20"
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            {REACTION_EMOJIS.map((emoji) => (
-                              <button
-                                key={emoji}
-                                type="button"
-                                onClick={() => {
-                                  onReactMessage(activeDmId, msg.id, emoji);
-                                  setSelectedMsgId(null);
-                                }}
-                                className="h-9 w-9 rounded-full hover:bg-slate-100 dark:hover:bg-white/[0.08] flex items-center justify-center text-sm"
-                              >
-                                {emoji}
-                              </button>
-                            ))}
-                            <div className="h-5 w-px bg-slate-200 dark:bg-white/[0.1] mx-0.5" />
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setReplyTo({
-                                  id: msg.id,
-                                  senderName: msg.senderName,
-                                  text: msg.text,
-                                });
-                                setSelectedMsgId(null);
-                                inputRef.current?.focus();
-                              }}
-                              aria-label="Reply"
-                              className="h-9 w-9 rounded-full hover:bg-slate-100 dark:hover:bg-white/[0.08] flex items-center justify-center text-slate-700 dark:text-zinc-200"
-                            >
-                              <Reply className="w-4 h-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                try {
-                                  navigator.clipboard.writeText(msg.text);
-                                  onShowToast('Copied');
-                                } catch {
-                                  // Ignore
-                                }
-                                setSelectedMsgId(null);
-                              }}
-                              aria-label="Copy"
-                              className="h-9 w-9 rounded-full hover:bg-slate-100 dark:hover:bg-white/[0.08] flex items-center justify-center text-slate-700 dark:text-zinc-200"
-                            >
-                              <Copy className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                onDeleteMessage(activeDmId, msg.id);
-                                setSelectedMsgId(null);
-                              }}
-                              aria-label="Delete"
-                              className="h-9 w-9 rounded-full hover:bg-rose-50 dark:hover:bg-rose-950/40 flex items-center justify-center text-rose-500"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
                           </div>
                         )}
                       </div>
@@ -923,6 +941,116 @@ export function MessengerWindow({
             </div>
           </div>
         </div>
+
+        {/* Long-Press Frosted Glass Action Sheet (Unsend / React / Reply / Copy) */}
+        {(() => {
+          const selectedMsg = selectedMsgId
+            ? activeMessages.find((m) => m.id === selectedMsgId && !m.unsent) ?? null
+            : null;
+          if (!selectedMsg) return null;
+          const selectedIsMine = selectedMsg.fromUserId === currentUser.userId;
+
+          return (
+            <div
+              className={`${
+                isMobileFrame ? 'absolute' : 'fixed'
+              } inset-0 z-50 flex flex-col items-center justify-center p-5 bg-black/35 backdrop-blur-md`}
+              onClick={() => {
+                if (Date.now() - modalOpenedAtRef.current < 450) return;
+                setSelectedMsgId(null);
+              }}
+              role="dialog"
+              aria-modal="true"
+              aria-label="Message options"
+            >
+              <div
+                className="w-full max-w-[300px] space-y-3"
+                onClick={(e) => e.stopPropagation()}
+              >
+                {/* Frosted Message Preview */}
+                <div
+                  className={`px-4 py-2.5 rounded-2xl shadow-xl backdrop-blur-xl border ${
+                    selectedIsMine
+                      ? 'bg-blue-600/90 border-blue-400/40 text-white ml-auto max-w-[85%]'
+                      : 'bg-white/85 dark:bg-zinc-900/85 border-white/50 dark:border-white/15 text-slate-900 dark:text-white mr-auto max-w-[85%]'
+                  }`}
+                >
+                  <p className="text-[14px] leading-relaxed whitespace-pre-wrap break-words max-h-32 overflow-y-auto no-scrollbar">
+                    {selectedMsg.text}
+                  </p>
+                </div>
+
+                {/* Frosted Glass Reactions Pill */}
+                <div className="px-2 py-1.5 rounded-full backdrop-blur-2xl bg-white/80 dark:bg-zinc-900/80 border border-white/60 dark:border-white/15 shadow-2xl flex items-center justify-between">
+                  {REACTION_EMOJIS.map((emoji) => (
+                    <button
+                      key={emoji}
+                      type="button"
+                      onClick={() => {
+                        onReactMessage(activeDmId, selectedMsg.id, emoji);
+                        setSelectedMsgId(null);
+                      }}
+                      className="h-10 w-10 rounded-full hover:bg-black/5 dark:hover:bg-white/10 active:scale-110 transition-transform flex items-center justify-center text-lg"
+                    >
+                      {emoji}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Frosted Glass Actions List */}
+                <div className="rounded-2xl overflow-hidden backdrop-blur-2xl bg-white/80 dark:bg-zinc-900/80 border border-white/60 dark:border-white/15 shadow-2xl divide-y divide-slate-900/10 dark:divide-white/10">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReplyTo({
+                        id: selectedMsg.id,
+                        senderName: selectedMsg.senderName,
+                        text: selectedMsg.text,
+                      });
+                      setSelectedMsgId(null);
+                      inputRef.current?.focus();
+                    }}
+                    className="w-full px-4 py-3 flex items-center justify-between text-sm font-medium text-slate-900 dark:text-white hover:bg-black/5 dark:hover:bg-white/5"
+                  >
+                    <span>Reply</span>
+                    <Reply className="w-4 h-4 opacity-75" />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      try {
+                        navigator.clipboard.writeText(selectedMsg.text);
+                        onShowToast('Copied');
+                      } catch {
+                        // Ignore
+                      }
+                      setSelectedMsgId(null);
+                    }}
+                    className="w-full px-4 py-3 flex items-center justify-between text-sm font-medium text-slate-900 dark:text-white hover:bg-black/5 dark:hover:bg-white/5"
+                  >
+                    <span>Copy</span>
+                    <Copy className="w-4 h-4 opacity-75" />
+                  </button>
+
+                  {selectedIsMine && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onDeleteMessage(activeDmId, selectedMsg.id);
+                        setSelectedMsgId(null);
+                      }}
+                      className="w-full px-4 py-3 flex items-center justify-between text-sm font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-500/10"
+                    >
+                      <span>Unsend</span>
+                      <RotateCcw className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        })()}
       </div>
     );
   }
@@ -937,7 +1065,7 @@ export function MessengerWindow({
       } flex flex-col bg-[#f2f2f7] dark:bg-black`}
     >
       {/* Messenger Top Bar */}
-      <header className="sticky top-0 shrink-0 z-30 h-[62px] px-4 flex items-center justify-between gap-2 bg-[#f2f2f7]/90 dark:bg-black/90 backdrop-blur-xl">
+      <header className="sticky top-0 shrink-0 z-30 min-h-[calc(62px+env(safe-area-inset-top))] pt-[env(safe-area-inset-top)] px-4 flex items-center justify-between gap-2 bg-[#f2f2f7]/90 dark:bg-black/90 backdrop-blur-xl">
         <div className="flex items-center gap-2 min-w-0">
           <button
             type="button"
@@ -1152,6 +1280,8 @@ export function MessengerWindow({
                           className={`text-xs truncate ${
                             isTyping
                               ? 'font-medium text-emerald-600 dark:text-emerald-400'
+                              : lastMsg?.unsent
+                              ? 'italic text-slate-400 dark:text-zinc-500'
                               : unread > 0
                               ? 'font-semibold text-slate-900 dark:text-white'
                               : 'text-slate-500 dark:text-zinc-400'
@@ -1160,7 +1290,11 @@ export function MessengerWindow({
                           {isTyping
                             ? 'typing…'
                             : lastMsg
-                            ? `${lastMsg.fromUserId === currentUser.userId ? 'You: ' : ''}${lastMsg.text}`
+                            ? lastMsg.unsent
+                              ? lastMsg.fromUserId === currentUser.userId
+                                ? 'You unsent a message'
+                                : 'This message was deleted'
+                              : `${lastMsg.fromUserId === currentUser.userId ? 'You: ' : ''}${lastMsg.text}`
                             : isOnline
                             ? `Online · @${peer.handle}`
                             : `${formatLastSeen(lastSeenTs, nowTick)} · @${peer.handle}`}

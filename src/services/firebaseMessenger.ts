@@ -22,6 +22,7 @@ import {
 import {
   collection,
   deleteDoc,
+  deleteField,
   doc,
   getDoc,
   onSnapshot,
@@ -307,6 +308,7 @@ export function subscribeToFirebaseChats(
       }
     ) => void;
     onKnownChatsChange?: (chatIds: Set<string>) => void;
+    onRecovered?: () => void;
     onError?: (err: Error) => void;
   }
 ): () => void {
@@ -363,9 +365,13 @@ export function subscribeToFirebaseChats(
     where('participants', 'array-contains', myUid)
   );
 
+  const msgRetryTimers = new Map<string, number>();
+  const msgRetryCounts = new Map<string, number>();
+
   const unsubChats = onSnapshot(
     chatsQuery,
     (snapshot) => {
+      callbacks.onRecovered?.();
       const currentChatIds = new Set<string>();
 
       snapshot.docs.forEach((chatDoc) => {
@@ -470,7 +476,8 @@ export function subscribeToFirebaseChats(
             });
         }
 
-        if (!messageUnsubs.has(chatId)) {
+        const attachMessagesListener = () => {
+          if (messageUnsubs.has(chatId)) return;
           const msgsQuery = query(
             collection(db!, 'chats', chatId, 'messages'),
             orderBy('createdAt', 'asc')
@@ -479,6 +486,8 @@ export function subscribeToFirebaseChats(
           const unsubMsgs = onSnapshot(
             msgsQuery,
             (msgSnap) => {
+              msgRetryCounts.delete(chatId);
+              callbacks.onRecovered?.();
               const msgs: DirectMessage[] = msgSnap.docs.map((d) => {
                 const m = d.data() as Partial<DirectMessage> & {
                   senderId?: string;
@@ -492,8 +501,15 @@ export function subscribeToFirebaseChats(
                   text: m.text || '',
                   createdAt:
                     typeof m.createdAt === 'number' ? m.createdAt : Date.now(),
-                  replyTo: m.replyTo,
-                  reactions: Array.isArray(m.reactions) ? m.reactions : [],
+                  unsent: Boolean(m.unsent),
+                  unsentAt:
+                    typeof m.unsentAt === 'number' ? m.unsentAt : undefined,
+                  replyTo: m.unsent ? undefined : m.replyTo,
+                  reactions: m.unsent
+                    ? []
+                    : Array.isArray(m.reactions)
+                    ? m.reactions
+                    : [],
                 };
               });
 
@@ -521,11 +537,40 @@ export function subscribeToFirebaseChats(
               callbacks.onMessagesUpdate(chatId, msgs);
             },
             (err) => {
+              unsubMsgs();
+              messageUnsubs.delete(chatId);
+              const attempts = msgRetryCounts.get(chatId) ?? 0;
+              if (
+                err.message.toLowerCase().includes('permission') &&
+                attempts < 3
+              ) {
+                msgRetryCounts.set(chatId, attempts + 1);
+                const prevRetry = msgRetryTimers.get(chatId);
+                if (prevRetry) window.clearTimeout(prevRetry);
+                const delay = attempts === 0 ? 1200 : 2500;
+                const retryTimer = window.setTimeout(() => {
+                  msgRetryTimers.delete(chatId);
+                  void auth?.currentUser
+                    ?.getIdToken(true)
+                    .catch(() => {})
+                    .finally(() => {
+                      if (knownChatIds.has(chatId)) {
+                        attachMessagesListener();
+                      }
+                    });
+                }, delay);
+                msgRetryTimers.set(chatId, retryTimer);
+                return;
+              }
               callbacks.onError?.(err);
             }
           );
 
           messageUnsubs.set(chatId, unsubMsgs);
+        };
+
+        if (!messageUnsubs.has(chatId) && !chatDoc.metadata.hasPendingWrites) {
+          attachMessagesListener();
         }
       });
 
@@ -551,6 +596,9 @@ export function subscribeToFirebaseChats(
 
   return () => {
     unsubChats();
+    for (const timer of msgRetryTimers.values()) {
+      window.clearTimeout(timer);
+    }
     for (const timer of typingExpireTimers.values()) {
       window.clearTimeout(timer);
     }
@@ -560,6 +608,8 @@ export function subscribeToFirebaseChats(
     for (const unsub of rtdbTypingUnsubs.values()) {
       unsub();
     }
+    msgRetryTimers.clear();
+    msgRetryCounts.clear();
     typingExpireTimers.clear();
     messageUnsubs.clear();
     rtdbTypingUnsubs.clear();
@@ -911,27 +961,35 @@ export async function sendFirebaseDirectMessage(params: {
       });
     } catch {
       // Fallback to create if doc wasn't created remotely yet
-      await setDoc(chatRef, {
-        participants: [myUid, peerUid].sort(),
-        updatedAt: now,
-        lastMessage: {
-          text,
-          senderId: myUid,
-          createdAt: now,
+      await setDoc(
+        chatRef,
+        {
+          participants: [myUid, peerUid].sort(),
+          updatedAt: now,
+          lastMessage: {
+            text,
+            senderId: myUid,
+            createdAt: now,
+          },
         },
-      });
+        { merge: true }
+      );
     }
   } else {
     try {
-      await setDoc(chatRef, {
-        participants: [myUid, peerUid].sort(),
-        updatedAt: now,
-        lastMessage: {
-          text,
-          senderId: myUid,
-          createdAt: now,
+      await setDoc(
+        chatRef,
+        {
+          participants: [myUid, peerUid].sort(),
+          updatedAt: now,
+          lastMessage: {
+            text,
+            senderId: myUid,
+            createdAt: now,
+          },
         },
-      });
+        { merge: true }
+      );
     } catch {
       // If chat already existed concurrently, update metadata only
       await updateDoc(chatRef, {
@@ -1036,11 +1094,17 @@ export async function deleteFirebaseDirectMessage(
 ): Promise<void> {
   if (!db) return;
   try {
-    await deleteDoc(doc(db, 'chats', chatId, 'messages', messageId));
+    await updateDoc(doc(db, 'chats', chatId, 'messages', messageId), {
+      text: '',
+      unsent: true,
+      unsentAt: Date.now(),
+      replyTo: deleteField(),
+      reactions: [],
+    });
   } catch (error) {
     handleFirestoreError(
       error,
-      OperationType.DELETE,
+      OperationType.UPDATE,
       `chats/${chatId}/messages/${messageId}`
     );
   }
@@ -1052,7 +1116,10 @@ export async function registerFirebasePushNotifications(
   if (typeof Notification === 'undefined') {
     return { ok: false, reason: 'unsupported' };
   }
-  const permission = await Notification.requestPermission();
+  const permission =
+    Notification.permission === 'granted'
+      ? 'granted'
+      : await Notification.requestPermission();
   if (permission !== 'granted') {
     return { ok: false, reason: 'denied' };
   }
@@ -1065,9 +1132,15 @@ export async function registerFirebasePushNotifications(
   try {
     let swReg: ServiceWorkerRegistration | undefined;
     if ('serviceWorker' in navigator) {
-      swReg = await navigator.serviceWorker.register('/firebase-messaging-sw.js', {
-        scope: '/firebase-cloud-messaging-push-scope',
-      });
+      const existingRoot = await navigator.serviceWorker.getRegistration('/');
+      if (existingRoot && (import.meta.env.PROD || existingRoot.active?.scriptURL.includes('firebase-messaging-sw.js'))) {
+        swReg = existingRoot;
+      } else {
+        swReg = await navigator.serviceWorker.register('/firebase-messaging-sw.js', {
+          scope: '/',
+        });
+      }
+
       if (!swReg.active) {
         const pending = swReg.installing || swReg.waiting;
         if (
@@ -1079,7 +1152,7 @@ export async function registerFirebasePushNotifications(
             const timeout = window.setTimeout(() => {
               pending.removeEventListener('statechange', onState);
               resolve();
-            }, 4000);
+            }, 6000);
             const onState = () => {
               if (pending.state === 'activated' || pending.state === 'redundant') {
                 window.clearTimeout(timeout);
@@ -1089,6 +1162,9 @@ export async function registerFirebasePushNotifications(
             };
             pending.addEventListener('statechange', onState);
           });
+        }
+        if (!swReg.active) {
+          swReg = await navigator.serviceWorker.ready;
         }
       }
     }
@@ -1108,7 +1184,7 @@ export async function registerFirebasePushNotifications(
     }
     return { ok: true, reason: 'no-token' };
   } catch (err) {
-    console.warn('FCM registration skipped:', err);
+    console.warn('FCM registration error:', err);
     return { ok: true, reason: 'browser-fallback' };
   }
 }
