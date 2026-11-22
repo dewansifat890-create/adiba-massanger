@@ -1,0 +1,1124 @@
+import {
+  createUserWithEmailAndPassword,
+  EmailAuthProvider,
+  GoogleAuthProvider,
+  linkWithCredential,
+  onAuthStateChanged,
+  signInAnonymously,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut,
+  User,
+} from 'firebase/auth';
+import {
+  goOffline,
+  goOnline,
+  onDisconnect,
+  onValue,
+  ref as rtdbRef,
+  serverTimestamp as rtdbServerTimestamp,
+  set as rtdbSet,
+} from 'firebase/database';
+import {
+  collection,
+  deleteDoc,
+  doc,
+  getDoc,
+  onSnapshot,
+  orderBy,
+  query,
+  setDoc,
+  Unsubscribe,
+  updateDoc,
+  where,
+} from 'firebase/firestore';
+import { getToken, onMessage } from 'firebase/messaging';
+import {
+  auth,
+  db,
+  getFirebaseMessagingSafe,
+  handleFirestoreError,
+  OperationType,
+  rtdb,
+  VAPID_KEY,
+} from '../lib/firebase';
+import {
+  ChatReaction,
+  ChatReplyPreview,
+  DirectMessage,
+  MessengerUser,
+} from '../types/notes';
+
+export function makeDmId(userA: string, userB: string): string {
+  return [userA, userB].sort().join('__');
+}
+
+export function sanitizeHandle(raw: string, fallbackUid?: string): string {
+  const cleaned = raw
+    .trim()
+    .toLowerCase()
+    .replace(/^@+/, '')
+    .replace(/[^a-z0-9_-]/g, '');
+  if (cleaned.length >= 3) return cleaned.slice(0, 28);
+  if (fallbackUid) return `user-${fallbackUid.slice(0, 5).toLowerCase()}`;
+  return `user-${Math.floor(1000 + Math.random() * 9000)}`;
+}
+
+export async function waitForInitialAuthUser(): Promise<User | null> {
+  if (!auth) return null;
+  if (auth.currentUser) return auth.currentUser;
+  return new Promise((resolve) => {
+    const unsub = onAuthStateChanged(auth!, (user) => {
+      unsub();
+      resolve(user);
+    });
+  });
+}
+
+export async function ensureFirebaseSignedIn(): Promise<{
+  user: User | null;
+  errorCode?: string;
+}> {
+  if (!auth) return { user: null, errorCode: 'not-configured' };
+  const existing = await waitForInitialAuthUser();
+  if (existing) return { user: existing };
+  try {
+    const cred = await signInAnonymously(auth);
+    return { user: cred.user };
+  } catch (err: unknown) {
+    const code =
+      typeof err === 'object' && err !== null && 'code' in err
+        ? String((err as { code: unknown }).code)
+        : 'auth-error';
+    return { user: null, errorCode: code };
+  }
+}
+
+export async function signInEmailPassword(
+  email: string,
+  password: string,
+  createNew: boolean
+): Promise<User> {
+  if (!auth) throw new Error('Firebase Auth is not initialized');
+  if (createNew) {
+    if (auth.currentUser && auth.currentUser.isAnonymous) {
+      const cred = EmailAuthProvider.credential(email.trim(), password);
+      const linked = await linkWithCredential(auth.currentUser, cred);
+      return linked.user;
+    }
+    const created = await createUserWithEmailAndPassword(
+      auth,
+      email.trim(),
+      password
+    );
+    return created.user;
+  }
+  const signedIn = await signInWithEmailAndPassword(auth, email.trim(), password);
+  return signedIn.user;
+}
+
+export async function signInGoogleAccount(): Promise<User> {
+  if (!auth) throw new Error('Firebase Auth is not initialized');
+  const provider = new GoogleAuthProvider();
+  const res = await signInWithPopup(auth, provider);
+  return res.user;
+}
+
+export async function signOutFirebaseAccount(): Promise<void> {
+  if (!auth) return;
+  await signOut(auth);
+}
+
+export async function syncFirebaseUserProfile(
+  uid: string,
+  desiredDisplayName: string,
+  desiredHandle: string,
+  fcmToken?: string
+): Promise<MessengerUser> {
+  if (!db) {
+    return {
+      userId: uid,
+      handle: sanitizeHandle(desiredHandle, uid),
+      displayName: desiredDisplayName.trim() || 'User',
+    };
+  }
+
+  const cleanName = desiredDisplayName.trim() || 'User';
+  let targetHandle = sanitizeHandle(desiredHandle, uid);
+
+  let existingHandle: string | null = null;
+  let existingToken: string | undefined;
+  try {
+    const userSnap = await getDoc(doc(db, 'users', uid));
+    if (userSnap.exists()) {
+      const data = userSnap.data() as { handle?: string; fcmToken?: string };
+      existingHandle = data.handle || null;
+      existingToken = data.fcmToken;
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, `users/${uid}`);
+  }
+
+  // Claim or verify unique handle in /handles/{handle}
+  let handleClaimed = false;
+  try {
+    const handleRef = doc(db, 'handles', targetHandle);
+    const handleSnap = await getDoc(handleRef);
+    if (!handleSnap.exists()) {
+      await setDoc(handleRef, {
+        uid,
+        handle: targetHandle,
+        updatedAt: Date.now(),
+      });
+      handleClaimed = true;
+    } else {
+      const data = handleSnap.data() as { uid?: string };
+      if (data.uid === uid) {
+        handleClaimed = true;
+      }
+    }
+  } catch {
+    // Handle might already belong to someone else or permission check
+  }
+
+  if (!handleClaimed) {
+    if (existingHandle) {
+      targetHandle = existingHandle;
+    } else {
+      targetHandle = `${targetHandle.slice(0, 20)}-${uid.slice(0, 4).toLowerCase()}`;
+      try {
+        await setDoc(doc(db, 'handles', targetHandle), {
+          uid,
+          handle: targetHandle,
+          updatedAt: Date.now(),
+        });
+      } catch {
+        // Ignore fallback handle conflict
+      }
+    }
+  } else if (existingHandle && existingHandle !== targetHandle) {
+    try {
+      await deleteDoc(doc(db, 'handles', existingHandle));
+    } catch {
+      // Ignore old handle cleanup error
+    }
+  }
+
+  const userPayload: Record<string, unknown> = {
+    uid,
+    handle: targetHandle,
+    displayName: cleanName,
+    updatedAt: Date.now(),
+    isOnline: typeof navigator !== 'undefined' ? navigator.onLine : true,
+    lastSeen: Date.now(),
+  };
+  if (fcmToken) {
+    userPayload.fcmToken = fcmToken;
+  } else if (existingToken) {
+    userPayload.fcmToken = existingToken;
+  }
+
+  try {
+    await setDoc(doc(db, 'users', uid), userPayload, { merge: true });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `users/${uid}`);
+  }
+
+  return {
+    userId: uid,
+    handle: targetHandle,
+    displayName: cleanName,
+  };
+}
+
+export async function lookupFirebaseUser(
+  rawQuery: string
+): Promise<MessengerUser | null> {
+  if (!db) return null;
+  const cleanHandle = rawQuery
+    .trim()
+    .toLowerCase()
+    .replace(/^@+/, '')
+    .replace(/[^a-z0-9_-]/g, '');
+
+  if (cleanHandle) {
+    try {
+      const handleSnap = await getDoc(doc(db, 'handles', cleanHandle));
+      if (handleSnap.exists()) {
+        const { uid } = handleSnap.data() as { uid?: string };
+        if (uid) {
+          const userSnap = await getDoc(doc(db, 'users', uid));
+          if (userSnap.exists()) {
+            const u = userSnap.data() as {
+              uid?: string;
+              handle?: string;
+              displayName?: string;
+            };
+            return {
+              userId: uid,
+              handle: u.handle || cleanHandle,
+              displayName: u.displayName || cleanHandle,
+            };
+          }
+        }
+      }
+    } catch {
+      // Fall through to UID lookup
+    }
+  }
+
+  // Fallback: direct UID lookup if user pasted a UID
+  const rawId = rawQuery.trim();
+  if (rawId && rawId.length >= 6 && !rawId.includes('/')) {
+    try {
+      const userSnap = await getDoc(doc(db, 'users', rawId));
+      if (userSnap.exists()) {
+        const u = userSnap.data() as {
+          handle?: string;
+          displayName?: string;
+        };
+        return {
+          userId: rawId,
+          handle: u.handle || rawId.slice(0, 10),
+          displayName: u.displayName || 'User',
+        };
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+export function subscribeToFirebaseChats(
+  myUid: string,
+  callbacks: {
+    onPeerProfile: (peer: MessengerUser) => void;
+    onMessagesUpdate: (dmId: string, messages: DirectMessage[]) => void;
+    onNewIncomingMessage: (peerId: string, msg: DirectMessage) => void;
+    onChatMetaUpdate?: (
+      dmId: string,
+      peerId: string,
+      meta: {
+        peerDeliveredAt: number;
+        peerSeenAt: number;
+        peerTyping: boolean;
+      }
+    ) => void;
+    onKnownChatsChange?: (chatIds: Set<string>) => void;
+    onError?: (err: Error) => void;
+  }
+): () => void {
+  if (!db) return () => {};
+
+  const messageUnsubs = new Map<string, Unsubscribe>();
+  const rtdbTypingUnsubs = new Map<string, Unsubscribe>();
+  const fetchedPeers = new Set<string>();
+  const initialLoadedChats = new Set<string>();
+  const seenMsgIds = new Set<string>();
+  const knownChatIds = new Set<string>();
+  const typingExpireTimers = new Map<string, number>();
+  const chatMetaState = new Map<
+    string,
+    {
+      peerId: string;
+      peerDeliveredAt: number;
+      peerSeenAt: number;
+      lastFsTypingVal: number;
+      lastRtdbTypingVal: number;
+      typingReceivedLocalAt: number;
+    }
+  >();
+
+  const emitChatMeta = (chatId: string) => {
+    const st = chatMetaState.get(chatId);
+    if (!st) return;
+    const isTyping =
+      st.typingReceivedLocalAt > 0 &&
+      Date.now() - st.typingReceivedLocalAt < 4500;
+    callbacks.onChatMetaUpdate?.(chatId, st.peerId, {
+      peerDeliveredAt: st.peerDeliveredAt,
+      peerSeenAt: st.peerSeenAt,
+      peerTyping: isTyping,
+    });
+  };
+
+  const scheduleTypingExpiry = (chatId: string) => {
+    const prevTimer = typingExpireTimers.get(chatId);
+    if (prevTimer) window.clearTimeout(prevTimer);
+    const timer = window.setTimeout(() => {
+      typingExpireTimers.delete(chatId);
+      const st = chatMetaState.get(chatId);
+      if (st && st.typingReceivedLocalAt > 0) {
+        st.typingReceivedLocalAt = 0;
+        emitChatMeta(chatId);
+      }
+    }, 4500);
+    typingExpireTimers.set(chatId, timer);
+  };
+
+  const chatsQuery = query(
+    collection(db, 'chats'),
+    where('participants', 'array-contains', myUid)
+  );
+
+  const unsubChats = onSnapshot(
+    chatsQuery,
+    (snapshot) => {
+      const currentChatIds = new Set<string>();
+
+      snapshot.docs.forEach((chatDoc) => {
+        const chatId = chatDoc.id;
+        currentChatIds.add(chatId);
+        knownChatIds.add(chatId);
+
+        const data = chatDoc.data() as {
+          participants?: string[];
+          deliveryReceipts?: Record<string, number>;
+          readReceipts?: Record<string, number>;
+          typing?: Record<string, number>;
+        };
+        const peerId = (data.participants || []).find((p) => p !== myUid);
+
+        if (peerId) {
+          const prevMeta = chatMetaState.get(chatId);
+          const nextFsVal =
+            typeof data.typing?.[peerId] === 'number'
+              ? data.typing[peerId]
+              : 0;
+          let nextTypingLocalAt = prevMeta?.typingReceivedLocalAt ?? 0;
+
+          if (nextFsVal === 0 && (prevMeta?.lastFsTypingVal ?? 0) > 0) {
+            nextTypingLocalAt = 0;
+          } else if (nextFsVal > 0 && nextFsVal !== prevMeta?.lastFsTypingVal) {
+            nextTypingLocalAt = Date.now();
+            scheduleTypingExpiry(chatId);
+          }
+
+          chatMetaState.set(chatId, {
+            peerId,
+            peerDeliveredAt:
+              typeof data.deliveryReceipts?.[peerId] === 'number'
+                ? data.deliveryReceipts[peerId]
+                : prevMeta?.peerDeliveredAt ?? 0,
+            peerSeenAt:
+              typeof data.readReceipts?.[peerId] === 'number'
+                ? data.readReceipts[peerId]
+                : prevMeta?.peerSeenAt ?? 0,
+            lastFsTypingVal: nextFsVal,
+            lastRtdbTypingVal: prevMeta?.lastRtdbTypingVal ?? 0,
+            typingReceivedLocalAt: nextTypingLocalAt,
+          });
+          emitChatMeta(chatId);
+
+          if (rtdb && !rtdbTypingUnsubs.has(chatId)) {
+            const typingPath = rtdbRef(rtdb, `typing/${chatId}/${peerId}`);
+            const unsubTyping = onValue(
+              typingPath,
+              (snap) => {
+                const val = snap.val() as number | null;
+                const st = chatMetaState.get(chatId);
+                if (!st) return;
+                const nextRtdbVal = typeof val === 'number' ? val : 0;
+                if (nextRtdbVal > 0) {
+                  st.lastRtdbTypingVal = nextRtdbVal;
+                  st.typingReceivedLocalAt = Date.now();
+                  scheduleTypingExpiry(chatId);
+                } else {
+                  st.lastRtdbTypingVal = 0;
+                  st.typingReceivedLocalAt = 0;
+                }
+                emitChatMeta(chatId);
+              },
+              () => {
+                // RTDB rules may not be enabled yet; Firestore typing handles fallback
+              }
+            );
+            rtdbTypingUnsubs.set(chatId, unsubTyping);
+          }
+        }
+
+        if (peerId && !fetchedPeers.has(peerId)) {
+          fetchedPeers.add(peerId);
+          void getDoc(doc(db!, 'users', peerId))
+            .then((peerSnap) => {
+              if (peerSnap.exists()) {
+                const p = peerSnap.data() as {
+                  handle?: string;
+                  displayName?: string;
+                  isOnline?: boolean;
+                  lastSeen?: number;
+                };
+                callbacks.onPeerProfile({
+                  userId: peerId,
+                  handle: p.handle || peerId.slice(0, 10),
+                  displayName: p.displayName || 'User',
+                  isOnline: Boolean(p.isOnline),
+                  lastSeen: typeof p.lastSeen === 'number' ? p.lastSeen : undefined,
+                });
+              } else {
+                callbacks.onPeerProfile({
+                  userId: peerId,
+                  handle: peerId.slice(0, 10),
+                  displayName: 'User',
+                });
+              }
+            })
+            .catch(() => {
+              // Ignore transient peer fetch error
+            });
+        }
+
+        if (!messageUnsubs.has(chatId)) {
+          const msgsQuery = query(
+            collection(db!, 'chats', chatId, 'messages'),
+            orderBy('createdAt', 'asc')
+          );
+
+          const unsubMsgs = onSnapshot(
+            msgsQuery,
+            (msgSnap) => {
+              const msgs: DirectMessage[] = msgSnap.docs.map((d) => {
+                const m = d.data() as Partial<DirectMessage> & {
+                  senderId?: string;
+                };
+                return {
+                  id: d.id,
+                  dmId: chatId,
+                  fromUserId: m.fromUserId || m.senderId || '',
+                  toUserId: m.toUserId || '',
+                  senderName: m.senderName || 'User',
+                  text: m.text || '',
+                  createdAt:
+                    typeof m.createdAt === 'number' ? m.createdAt : Date.now(),
+                  replyTo: m.replyTo,
+                  reactions: Array.isArray(m.reactions) ? m.reactions : [],
+                };
+              });
+
+              const wasInitialized = initialLoadedChats.has(chatId);
+              if (!wasInitialized) {
+                msgs.forEach((m) => seenMsgIds.add(m.id));
+                initialLoadedChats.add(chatId);
+              } else {
+                msgSnap.docChanges().forEach((change) => {
+                  if (change.type === 'added') {
+                    const m = msgs.find((x) => x.id === change.doc.id);
+                    if (
+                      m &&
+                      !seenMsgIds.has(m.id) &&
+                      m.fromUserId !== myUid
+                    ) {
+                      seenMsgIds.add(m.id);
+                      callbacks.onNewIncomingMessage(m.fromUserId, m);
+                    }
+                  }
+                });
+                msgs.forEach((m) => seenMsgIds.add(m.id));
+              }
+
+              callbacks.onMessagesUpdate(chatId, msgs);
+            },
+            (err) => {
+              callbacks.onError?.(err);
+            }
+          );
+
+          messageUnsubs.set(chatId, unsubMsgs);
+        }
+      });
+
+      for (const [existingId, unsub] of messageUnsubs.entries()) {
+        if (!currentChatIds.has(existingId)) {
+          unsub();
+          messageUnsubs.delete(existingId);
+        }
+      }
+      for (const [existingId, unsub] of rtdbTypingUnsubs.entries()) {
+        if (!currentChatIds.has(existingId)) {
+          unsub();
+          rtdbTypingUnsubs.delete(existingId);
+        }
+      }
+
+      callbacks.onKnownChatsChange?.(new Set(knownChatIds));
+    },
+    (error) => {
+      callbacks.onError?.(error);
+    }
+  );
+
+  return () => {
+    unsubChats();
+    for (const timer of typingExpireTimers.values()) {
+      window.clearTimeout(timer);
+    }
+    for (const unsub of messageUnsubs.values()) {
+      unsub();
+    }
+    for (const unsub of rtdbTypingUnsubs.values()) {
+      unsub();
+    }
+    typingExpireTimers.clear();
+    messageUnsubs.clear();
+    rtdbTypingUnsubs.clear();
+  };
+}
+
+export function startFirebasePresence(myUid: string): () => void {
+  if (!db && !rtdb) return () => {};
+  let active = true;
+
+  const writeFirestorePresence = (online: boolean) => {
+    if (!db || !active) return;
+    void setDoc(
+      doc(db, 'users', myUid),
+      {
+        uid: myUid,
+        isOnline: online,
+        lastSeen: Date.now(),
+      },
+      { merge: true }
+    ).catch(() => {
+      // Ignore transient network error when going offline
+    });
+  };
+
+  let unsubRtdbConn: Unsubscribe | null = null;
+  if (rtdb) {
+    try {
+      const connectedRef = rtdbRef(rtdb, '.info/connected');
+      const userPresenceRef = rtdbRef(rtdb, `presence/${myUid}`);
+      if (navigator.onLine) {
+        void rtdbSet(userPresenceRef, {
+          online: true,
+          lastSeen: rtdbServerTimestamp(),
+        }).catch(() => {});
+      }
+      unsubRtdbConn = onValue(
+        connectedRef,
+        (snap) => {
+          if (!active) return;
+          if (snap.val() === true && navigator.onLine) {
+            void onDisconnect(userPresenceRef)
+              .set({
+                online: false,
+                lastSeen: rtdbServerTimestamp(),
+              })
+              .then(() =>
+                rtdbSet(userPresenceRef, {
+                  online: true,
+                  lastSeen: rtdbServerTimestamp(),
+                })
+              )
+              .catch(() => {
+                // RTDB rules may be locked; Firestore presence remains active
+              });
+          }
+        },
+        () => {
+          // Ignore RTDB connection listener error
+        }
+      );
+    } catch {
+      // Ignore RTDB init error
+    }
+  }
+
+  const handleOnline = () => {
+    if (!active) return;
+    if (rtdb) {
+      try {
+        goOnline(rtdb);
+        void rtdbSet(rtdbRef(rtdb, `presence/${myUid}`), {
+          online: true,
+          lastSeen: rtdbServerTimestamp(),
+        }).catch(() => {});
+      } catch {
+        // Ignore
+      }
+    }
+    writeFirestorePresence(true);
+  };
+
+  const handleOffline = () => {
+    if (!active) return;
+    if (rtdb) {
+      try {
+        void rtdbSet(rtdbRef(rtdb, `presence/${myUid}`), {
+          online: false,
+          lastSeen: rtdbServerTimestamp(),
+        }).catch(() => {});
+        goOffline(rtdb);
+      } catch {
+        // Ignore
+      }
+    }
+    writeFirestorePresence(false);
+  };
+
+  const handleVisibilityChange = () => {
+    if (!active) return;
+    if (document.visibilityState === 'visible') {
+      if (navigator.onLine) {
+        handleOnline();
+      } else {
+        handleOffline();
+      }
+    }
+  };
+
+  const handlePageHide = () => {
+    writeFirestorePresence(false);
+    if (rtdb) {
+      try {
+        void rtdbSet(rtdbRef(rtdb, `presence/${myUid}`), {
+          online: false,
+          lastSeen: rtdbServerTimestamp(),
+        }).catch(() => {});
+      } catch {
+        // Ignore
+      }
+    }
+  };
+
+  if (navigator.onLine) {
+    writeFirestorePresence(true);
+  } else {
+    writeFirestorePresence(false);
+  }
+
+  const heartbeatTimer = window.setInterval(() => {
+    if (!active) return;
+    if (navigator.onLine) {
+      writeFirestorePresence(true);
+      if (rtdb) {
+        void rtdbSet(rtdbRef(rtdb, `presence/${myUid}`), {
+          online: true,
+          lastSeen: rtdbServerTimestamp(),
+        }).catch(() => {});
+      }
+    } else {
+      writeFirestorePresence(false);
+    }
+  }, 10000);
+
+  window.addEventListener('online', handleOnline);
+  window.addEventListener('offline', handleOffline);
+  window.addEventListener('focus', handleOnline);
+  window.addEventListener('pagehide', handlePageHide);
+  window.addEventListener('beforeunload', handlePageHide);
+  document.addEventListener('visibilitychange', handleVisibilityChange);
+
+  return () => {
+    active = false;
+    window.clearInterval(heartbeatTimer);
+    window.removeEventListener('online', handleOnline);
+    window.removeEventListener('offline', handleOffline);
+    window.removeEventListener('focus', handleOnline);
+    window.removeEventListener('pagehide', handlePageHide);
+    window.removeEventListener('beforeunload', handlePageHide);
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
+    unsubRtdbConn?.();
+    if (rtdb) {
+      void rtdbSet(rtdbRef(rtdb, `presence/${myUid}`), {
+        online: false,
+        lastSeen: rtdbServerTimestamp(),
+      }).catch(() => {});
+    }
+    if (db) {
+      void setDoc(
+        doc(db, 'users', myUid),
+        { uid: myUid, isOnline: false, lastSeen: Date.now() },
+        { merge: true }
+      ).catch(() => {});
+    }
+  };
+}
+
+export function subscribeToPeerPresence(
+  peerUid: string,
+  onUpdate: (status: { isOnline: boolean; lastSeen?: number }) => void
+): () => void {
+  if ((!db && !rtdb) || !peerUid) return () => {};
+
+  let fsOnline: boolean | null = null;
+  let fsLastSeen: number | undefined;
+  let rtdbOnline: boolean | null = null;
+  let rtdbLastSeen: number | undefined;
+  let hasRtdbSignal = false;
+
+  const emit = () => {
+    if (hasRtdbSignal && rtdbOnline !== null) {
+      onUpdate({
+        isOnline: rtdbOnline,
+        lastSeen: rtdbLastSeen ?? fsLastSeen,
+      });
+      return;
+    }
+    const staleThreshold = 25000;
+    const freshByHeartbeat =
+      fsOnline === true &&
+      (typeof fsLastSeen !== 'number' || Date.now() - fsLastSeen < staleThreshold);
+    onUpdate({
+      isOnline: Boolean(freshByHeartbeat),
+      lastSeen: fsLastSeen,
+    });
+  };
+
+  let unsubFs: Unsubscribe | null = null;
+  if (db) {
+    unsubFs = onSnapshot(
+      doc(db, 'users', peerUid),
+      (snap) => {
+        if (!snap.exists()) return;
+        const d = snap.data() as { isOnline?: boolean; lastSeen?: number };
+        fsOnline = Boolean(d.isOnline);
+        fsLastSeen = typeof d.lastSeen === 'number' ? d.lastSeen : fsLastSeen;
+        emit();
+      },
+      () => {
+        // Ignore transient permission error
+      }
+    );
+  }
+
+  let unsubRtdb: Unsubscribe | null = null;
+  if (rtdb) {
+    unsubRtdb = onValue(
+      rtdbRef(rtdb, `presence/${peerUid}`),
+      (snap) => {
+        const val = snap.val() as { online?: boolean; lastSeen?: number } | null;
+        if (val && typeof val.online === 'boolean') {
+          hasRtdbSignal = true;
+          rtdbOnline = val.online;
+          if (typeof val.lastSeen === 'number') {
+            rtdbLastSeen = val.lastSeen;
+          }
+          emit();
+        }
+      },
+      () => {
+        // RTDB rules may not be set; Firestore listener remains active
+      }
+    );
+  }
+
+  const staleCheck = window.setInterval(emit, 8000);
+
+  return () => {
+    window.clearInterval(staleCheck);
+    unsubFs?.();
+    unsubRtdb?.();
+  };
+}
+
+export async function markFirebaseChatDelivered(
+  myUid: string,
+  chatId: string,
+  upToTs: number
+): Promise<void> {
+  if (!db) return;
+  try {
+    await updateDoc(doc(db, 'chats', chatId), {
+      [`deliveryReceipts.${myUid}`]: upToTs,
+    });
+  } catch {
+    // Ignore if chat doesn't exist yet
+  }
+}
+
+export async function markFirebaseChatSeen(
+  myUid: string,
+  chatId: string,
+  upToTs: number
+): Promise<void> {
+  if (!db) return;
+  try {
+    await updateDoc(doc(db, 'chats', chatId), {
+      [`deliveryReceipts.${myUid}`]: upToTs,
+      [`readReceipts.${myUid}`]: upToTs,
+    });
+  } catch {
+    // Ignore if chat doesn't exist yet
+  }
+}
+
+export async function sendFirebaseTypingStatus(
+  myUid: string,
+  peerUid: string,
+  isTyping: boolean
+): Promise<void> {
+  const chatId = makeDmId(myUid, peerUid);
+  const stamp = isTyping ? Date.now() : 0;
+
+  if (rtdb) {
+    try {
+      const typingNode = rtdbRef(rtdb, `typing/${chatId}/${myUid}`);
+      if (isTyping) {
+        void onDisconnect(typingNode).remove().catch(() => {});
+      }
+      void rtdbSet(typingNode, isTyping ? stamp : null).catch(() => {});
+    } catch {
+      // Ignore RTDB error
+    }
+  }
+
+  if (db) {
+    try {
+      await updateDoc(doc(db, 'chats', chatId), {
+        [`typing.${myUid}`]: stamp,
+      });
+    } catch {
+      // Chat might not exist before first message
+    }
+  }
+}
+
+export async function sendFirebaseDirectMessage(params: {
+  myUid: string;
+  myName: string;
+  peerUid: string;
+  text: string;
+  messageId: string;
+  replyTo?: ChatReplyPreview;
+  chatAlreadyExists: boolean;
+}): Promise<void> {
+  if (!db) throw new Error('Firestore not initialized');
+  const {
+    myUid,
+    myName,
+    peerUid,
+    text,
+    messageId,
+    replyTo,
+    chatAlreadyExists,
+  } = params;
+  const chatId = makeDmId(myUid, peerUid);
+  const now = Date.now();
+  const chatRef = doc(db, 'chats', chatId);
+
+  if (chatAlreadyExists) {
+    try {
+      await updateDoc(chatRef, {
+        updatedAt: now,
+        lastMessage: {
+          text,
+          senderId: myUid,
+          createdAt: now,
+        },
+      });
+    } catch {
+      // Fallback to create if doc wasn't created remotely yet
+      await setDoc(chatRef, {
+        participants: [myUid, peerUid].sort(),
+        updatedAt: now,
+        lastMessage: {
+          text,
+          senderId: myUid,
+          createdAt: now,
+        },
+      });
+    }
+  } else {
+    try {
+      await setDoc(chatRef, {
+        participants: [myUid, peerUid].sort(),
+        updatedAt: now,
+        lastMessage: {
+          text,
+          senderId: myUid,
+          createdAt: now,
+        },
+      });
+    } catch {
+      // If chat already existed concurrently, update metadata only
+      await updateDoc(chatRef, {
+        updatedAt: now,
+        lastMessage: {
+          text,
+          senderId: myUid,
+          createdAt: now,
+        },
+      });
+    }
+  }
+
+  const msgPayload: Record<string, unknown> = {
+    id: messageId,
+    dmId: chatId,
+    senderId: myUid,
+    fromUserId: myUid,
+    toUserId: peerUid,
+    senderName: myName,
+    text,
+    createdAt: now,
+    reactions: [],
+  };
+  if (replyTo) {
+    msgPayload.replyTo = replyTo;
+  }
+
+  try {
+    await setDoc(
+      doc(db, 'chats', chatId, 'messages', messageId),
+      msgPayload
+    );
+  } catch (error) {
+    handleFirestoreError(
+      error,
+      OperationType.CREATE,
+      `chats/${chatId}/messages/${messageId}`
+    );
+  }
+
+  // Trigger background disguised reminder push via backend if available
+  try {
+    const idToken = await auth?.currentUser?.getIdToken();
+    if (idToken) {
+      await fetch('/api/push/reminder', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ toUserId: peerUid }),
+      });
+    }
+  } catch {
+    // Non-blocking: foreground/realtime listeners still deliver messages
+  }
+}
+
+export async function toggleFirebaseMessageReaction(
+  myUid: string,
+  chatId: string,
+  messageId: string,
+  emoji: string,
+  currentReactions: ChatReaction[]
+): Promise<void> {
+  if (!db) return;
+  const reactions = currentReactions.map((r) => ({
+    emoji: r.emoji,
+    userIds: [...r.userIds],
+  }));
+  const idx = reactions.findIndex((r) => r.emoji === emoji);
+  if (idx >= 0) {
+    const entry = reactions[idx];
+    if (entry.userIds.includes(myUid)) {
+      const nextIds = entry.userIds.filter((id) => id !== myUid);
+      if (nextIds.length === 0) reactions.splice(idx, 1);
+      else reactions[idx] = { ...entry, userIds: nextIds };
+    } else {
+      reactions[idx] = { ...entry, userIds: [...entry.userIds, myUid] };
+    }
+  } else {
+    reactions.push({ emoji, userIds: [myUid] });
+  }
+
+  try {
+    await updateDoc(doc(db, 'chats', chatId, 'messages', messageId), {
+      reactions,
+    });
+  } catch (error) {
+    handleFirestoreError(
+      error,
+      OperationType.UPDATE,
+      `chats/${chatId}/messages/${messageId}`
+    );
+  }
+}
+
+export async function deleteFirebaseDirectMessage(
+  chatId: string,
+  messageId: string
+): Promise<void> {
+  if (!db) return;
+  try {
+    await deleteDoc(doc(db, 'chats', chatId, 'messages', messageId));
+  } catch (error) {
+    handleFirestoreError(
+      error,
+      OperationType.DELETE,
+      `chats/${chatId}/messages/${messageId}`
+    );
+  }
+}
+
+export async function registerFirebasePushNotifications(
+  uid: string
+): Promise<{ ok: boolean; token?: string; reason?: string }> {
+  if (typeof Notification === 'undefined') {
+    return { ok: false, reason: 'unsupported' };
+  }
+  const permission = await Notification.requestPermission();
+  if (permission !== 'granted') {
+    return { ok: false, reason: 'denied' };
+  }
+
+  const messaging = await getFirebaseMessagingSafe();
+  if (!messaging || !VAPID_KEY) {
+    return { ok: true, reason: 'browser-only' };
+  }
+
+  try {
+    let swReg: ServiceWorkerRegistration | undefined;
+    if ('serviceWorker' in navigator) {
+      swReg = await navigator.serviceWorker.register('/firebase-messaging-sw.js', {
+        scope: '/firebase-cloud-messaging-push-scope',
+      });
+      if (!swReg.active) {
+        const pending = swReg.installing || swReg.waiting;
+        if (
+          pending &&
+          pending.state !== 'activated' &&
+          pending.state !== 'redundant'
+        ) {
+          await new Promise<void>((resolve) => {
+            const timeout = window.setTimeout(() => {
+              pending.removeEventListener('statechange', onState);
+              resolve();
+            }, 4000);
+            const onState = () => {
+              if (pending.state === 'activated' || pending.state === 'redundant') {
+                window.clearTimeout(timeout);
+                pending.removeEventListener('statechange', onState);
+                resolve();
+              }
+            };
+            pending.addEventListener('statechange', onState);
+          });
+        }
+      }
+    }
+
+    const token = await getToken(messaging, {
+      vapidKey: VAPID_KEY,
+      serviceWorkerRegistration: swReg,
+    });
+
+    if (token && db) {
+      await setDoc(
+        doc(db, 'users', uid),
+        { fcmToken: token, updatedAt: Date.now() },
+        { merge: true }
+      );
+      return { ok: true, token };
+    }
+    return { ok: true, reason: 'no-token' };
+  } catch (err) {
+    console.warn('FCM registration skipped:', err);
+    return { ok: true, reason: 'browser-fallback' };
+  }
+}
+
+export async function attachForegroundMessageListener(
+  onReminder: () => void
+): Promise<() => void> {
+  const messaging = await getFirebaseMessagingSafe();
+  if (!messaging) return () => {};
+  return onMessage(messaging, () => {
+    onReminder();
+  });
+}

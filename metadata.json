@@ -1,0 +1,8 @@
+{
+  "name": "Remix Notes",
+  "description": "A clean, mobile-first notes app with smart checklists, folders, instant search, and customizable settings.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
