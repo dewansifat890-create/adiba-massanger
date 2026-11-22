@@ -752,11 +752,12 @@ export function startFirebasePresence(myUid: string): () => void {
     } else {
       writeFirestorePresence(false);
     }
-  }, 10000);
+  }, 15000);
 
   window.addEventListener('online', handleOnline);
   window.addEventListener('offline', handleOffline);
   window.addEventListener('focus', handleOnline);
+  window.addEventListener('pageshow', handleOnline);
   window.addEventListener('pagehide', handlePageHide);
   window.addEventListener('beforeunload', handlePageHide);
   document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -767,6 +768,7 @@ export function startFirebasePresence(myUid: string): () => void {
     window.removeEventListener('online', handleOnline);
     window.removeEventListener('offline', handleOffline);
     window.removeEventListener('focus', handleOnline);
+    window.removeEventListener('pageshow', handleOnline);
     window.removeEventListener('pagehide', handlePageHide);
     window.removeEventListener('beforeunload', handlePageHide);
     document.removeEventListener('visibilitychange', handleVisibilityChange);
@@ -807,7 +809,7 @@ export function subscribeToPeerPresence(
       });
       return;
     }
-    const staleThreshold = 25000;
+    const staleThreshold = 75000;
     const freshByHeartbeat =
       fsOnline === true &&
       (typeof fsLastSeen !== 'number' || Date.now() - fsLastSeen < staleThreshold);
@@ -1037,6 +1039,7 @@ export async function sendFirebaseDirectMessage(params: {
     if (idToken) {
       await fetch('/api/push/reminder', {
         method: 'POST',
+        keepalive: true,
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${idToken}`,
@@ -1126,17 +1129,46 @@ export async function registerFirebasePushNotifications(
 
   const messaging = await getFirebaseMessagingSafe();
   if (!messaging || !VAPID_KEY) {
-    return { ok: true, reason: 'browser-only' };
+    return { ok: false, reason: 'messaging-unsupported' };
   }
 
   try {
     let swReg: ServiceWorkerRegistration | undefined;
     if ('serviceWorker' in navigator) {
+      const targetSwUrl = import.meta.env.PROD
+        ? '/sw.js'
+        : '/firebase-messaging-sw.js';
+
+      // Clean up legacy FCM-scoped or conflicting SW registrations
+      try {
+        const allRegs = await navigator.serviceWorker.getRegistrations();
+        for (const reg of allRegs) {
+          const url =
+            reg.active?.scriptURL ||
+            reg.installing?.scriptURL ||
+            reg.waiting?.scriptURL ||
+            '';
+          if (
+            reg.scope.includes('firebase-cloud-messaging-push-scope') ||
+            (import.meta.env.PROD && url.includes('firebase-messaging-sw.js'))
+          ) {
+            await reg.unregister().catch(() => {});
+          }
+        }
+      } catch {
+        // Ignore cleanup errors
+      }
+
       const existingRoot = await navigator.serviceWorker.getRegistration('/');
-      if (existingRoot && (import.meta.env.PROD || existingRoot.active?.scriptURL.includes('firebase-messaging-sw.js'))) {
+      const existingUrl =
+        existingRoot?.active?.scriptURL ||
+        existingRoot?.installing?.scriptURL ||
+        existingRoot?.waiting?.scriptURL ||
+        '';
+      if (existingRoot && existingUrl.includes(targetSwUrl.replace(/^\//, ''))) {
         swReg = existingRoot;
       } else {
-        swReg = await navigator.serviceWorker.register('/firebase-messaging-sw.js', {
+        swReg = await navigator.serviceWorker.register(targetSwUrl, {
           scope: '/',
         });
       }
@@ -1164,15 +1196,41 @@ export async function registerFirebasePushNotifications(
           });
         }
         if (!swReg.active) {
-          swReg = await navigator.serviceWorker.ready;
+          swReg = await Promise.race([
+            navigator.serviceWorker.ready,
+            new Promise<ServiceWorkerRegistration>((resolve) =>
+              window.setTimeout(() => resolve(swReg!), 4000)
+            ),
+          ]);
         }
       }
     }
 
-    const token = await getToken(messaging, {
-      vapidKey: VAPID_KEY,
-      serviceWorkerRegistration: swReg,
-    });
+    let token = '';
+    try {
+      token = await getToken(messaging, {
+        vapidKey: VAPID_KEY,
+        serviceWorkerRegistration: swReg,
+      });
+    } catch (firstErr) {
+      // Recover from stale PushSubscription or corrupted VAPID subscription
+      if (swReg?.pushManager) {
+        try {
+          const existingSub = await swReg.pushManager.getSubscription();
+          if (existingSub) {
+            await existingSub.unsubscribe();
+          }
+          token = await getToken(messaging, {
+            vapidKey: VAPID_KEY,
+            serviceWorkerRegistration: swReg,
+          });
+        } catch {
+          throw firstErr;
+        }
+      } else {
+        throw firstErr;
+      }
+    }
 
     if (token && db) {
       await setDoc(
@@ -1182,19 +1240,37 @@ export async function registerFirebasePushNotifications(
       );
       return { ok: true, token };
     }
-    return { ok: true, reason: 'no-token' };
+    return { ok: false, reason: 'no-token' };
   } catch (err) {
     console.warn('FCM registration error:', err);
-    return { ok: true, reason: 'browser-fallback' };
+    return { ok: false, reason: 'token-error' };
   }
 }
 
 export async function attachForegroundMessageListener(
   onReminder: () => void
 ): Promise<() => void> {
+  let unsubFcm: (() => void) | null = null;
   const messaging = await getFirebaseMessagingSafe();
-  if (!messaging) return () => {};
-  return onMessage(messaging, () => {
-    onReminder();
-  });
+  if (messaging) {
+    unsubFcm = onMessage(messaging, () => {
+      onReminder();
+    });
+  }
+
+  const handleSwMessage = (event: MessageEvent) => {
+    if (event.data && event.data.type === 'NOTEPAD_PUSH_REMINDER') {
+      onReminder();
+    }
+  };
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.addEventListener('message', handleSwMessage);
+  }
+
+  return () => {
+    unsubFcm?.();
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.removeEventListener('message', handleSwMessage);
+    }
+  };
 }

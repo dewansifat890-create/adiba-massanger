@@ -210,6 +210,7 @@ export default function App() {
   const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(() => {
     return typeof Notification !== 'undefined' && Notification.permission === 'granted';
   });
+  const [pushTokenReady, setPushTokenReady] = useState<boolean>(false);
   const [showNotifPrompt, setShowNotifPrompt] = useState<boolean>(() => {
     try {
       if (localStorage.getItem(NOTIF_PROMPT_DONE_KEY) === '1') {
@@ -440,7 +441,10 @@ export default function App() {
           Notification.permission === 'granted'
         ) {
           void registerFirebasePushNotifications(fbUser.uid).then((r) => {
-            if (r.token) fcmTokenSavedRef.current = fbUser.uid;
+            if (r.token && !cancelled) {
+              fcmTokenSavedRef.current = fbUser.uid;
+              setPushTokenReady(true);
+            }
           });
         }
 
@@ -577,7 +581,10 @@ export default function App() {
       return;
     }
     const uid = auth.currentUser.uid;
-    if (fcmTokenSavedRef.current === uid) return;
+    if (fcmTokenSavedRef.current === uid) {
+      setPushTokenReady(true);
+      return;
+    }
 
     let cancelled = false;
     const tryRegisterFcm = () => {
@@ -585,6 +592,7 @@ export default function App() {
       void registerFirebasePushNotifications(uid).then((res) => {
         if (!cancelled && res.token) {
           fcmTokenSavedRef.current = uid;
+          setPushTokenReady(true);
         }
       });
     };
@@ -592,10 +600,12 @@ export default function App() {
     tryRegisterFcm();
     const retryTimer = window.setTimeout(tryRegisterFcm, 3000);
     window.addEventListener('focus', tryRegisterFcm);
+    window.addEventListener('online', tryRegisterFcm);
     return () => {
       cancelled = true;
       window.clearTimeout(retryTimer);
       window.removeEventListener('focus', tryRegisterFcm);
+      window.removeEventListener('online', tryRegisterFcm);
     };
   }, [firebaseStatus, notificationsEnabled]);
 
@@ -1170,17 +1180,23 @@ export default function App() {
 
   // Messenger handlers
   const handleToggleNotifications = async () => {
+    if (typeof Notification === 'undefined') {
+      const isIOS = /iphone|ipad|ipod/i.test(window.navigator.userAgent);
+      showToast(
+        isIOS
+          ? 'iPhone-এ নোটিফিকেশন পেতে Share → Add to Home Screen থেকে ওপেন করে Allow করুন'
+          : 'Browser notifications are not supported here'
+      );
+      return;
+    }
+
     try {
       localStorage.setItem(NOTIF_PROMPT_DONE_KEY, '1');
     } catch {
       // Ignore storage error
     }
 
-    if (typeof Notification === 'undefined') {
-      showToast('Browser notifications are not supported here');
-      return;
-    }
-    if (Notification.permission === 'granted' && notificationsEnabled) {
+    if (Notification.permission === 'granted' && notificationsEnabled && pushTokenReady) {
       setNotificationsEnabled(false);
       showToast('Notifications paused');
       return;
@@ -1189,21 +1205,21 @@ export default function App() {
     if (firebaseStatus === 'ready' && auth?.currentUser) {
       const uid = auth.currentUser.uid;
       const result = await registerFirebasePushNotifications(uid);
-      if (result.ok) {
+      if (result.token) {
         setNotificationsEnabled(true);
-        if (result.token) {
-          fcmTokenSavedRef.current = uid;
-        }
-        showToast(
-          result.token
-            ? 'Push reminders active'
-            : 'Disguised notifications enabled'
-        );
+        fcmTokenSavedRef.current = uid;
+        setPushTokenReady(true);
+        showToast('Background push notifications active');
       } else if (result.reason === 'denied') {
         setNotificationsEnabled(false);
+        setPushTokenReady(false);
         showToast('Notification permission denied');
+      } else if (Notification.permission === 'granted') {
+        setNotificationsEnabled(true);
+        setPushTokenReady(false);
+        showToast('Foreground alerts on — tap Retry if closed alerts fail');
       } else {
-        showToast('Browser notifications are not supported here');
+        showToast('Background push unavailable on this browser');
       }
       return;
     }
@@ -1214,10 +1230,13 @@ export default function App() {
       if (auth?.currentUser) {
         const uid = auth.currentUser.uid;
         void registerFirebasePushNotifications(uid).then((res) => {
-          if (res.token) fcmTokenSavedRef.current = uid;
+          if (res.token) {
+            fcmTokenSavedRef.current = uid;
+            setPushTokenReady(true);
+          }
         });
       }
-      showToast('Disguised notifications enabled');
+      showToast('Notifications enabled');
     } else {
       setNotificationsEnabled(false);
       showToast('Notification permission denied');
@@ -1291,6 +1310,7 @@ export default function App() {
           isAnonymousUser={isAnonymousUser}
           lookupResult={lookupResult}
           notificationsEnabled={notificationsEnabled}
+          pushTokenReady={pushTokenReady}
           accent={settings.accent}
           fontStyle={settings.fontStyle}
           isMobileFrame={isMobileFrame}
@@ -1921,10 +1941,12 @@ export default function App() {
           <button
             type="button"
             onClick={() => {
-              try {
-                localStorage.setItem(NOTIF_PROMPT_DONE_KEY, '1');
-              } catch {
-                // Ignore storage error
+              if (typeof Notification !== 'undefined') {
+                try {
+                  localStorage.setItem(NOTIF_PROMPT_DONE_KEY, '1');
+                } catch {
+                  // Ignore storage error
+                }
               }
               setShowNotifPrompt(false);
               void handleToggleNotifications();

@@ -67,13 +67,21 @@ if ('serviceWorker' in navigator) {
       .getRegistrations()
       .then((regs) => {
         for (const reg of regs) {
-          if (reg.scope.includes('firebase-cloud-messaging-push-scope')) {
+          const scriptUrl =
+            reg.active?.scriptURL ||
+            reg.installing?.scriptURL ||
+            reg.waiting?.scriptURL ||
+            '';
+          if (
+            reg.scope.includes('firebase-cloud-messaging-push-scope') ||
+            scriptUrl.includes('firebase-messaging-sw.js')
+          ) {
             void reg.unregister();
           }
         }
       })
       .catch(() => {});
-    registerSW({ immediate: false });
+    registerSW({ immediate: true });
   }
 }
 

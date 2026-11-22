@@ -138,55 +138,69 @@ async function startServer() {
   });
 
   app.get('/firebase-messaging-sw.js', (_req, res) => {
-    const swFirebaseConfig = {
-      apiKey:
-        process.env.VITE_FIREBASE_API_KEY ||
-        'AIzaSyAV5IDF9Fd0Kii5UE4z_3q4XlI-Gx70Woc',
-      authDomain:
-        process.env.VITE_FIREBASE_AUTH_DOMAIN ||
-        'adiba-massanger.firebaseapp.com',
-      databaseURL:
-        process.env.VITE_FIREBASE_DATABASE_URL ||
-        'https://adiba-massanger-default-rtdb.firebaseio.com',
-      projectId: process.env.VITE_FIREBASE_PROJECT_ID || 'adiba-massanger',
-      storageBucket:
-        process.env.VITE_FIREBASE_STORAGE_BUCKET ||
-        'adiba-massanger.firebasestorage.app',
-      messagingSenderId:
-        process.env.VITE_FIREBASE_MESSAGING_SENDER_ID || '892763194508',
-      appId:
-        process.env.VITE_FIREBASE_APP_ID ||
-        '1:892763194508:web:5914d6715f8c9aefa8e7a9',
-    };
-
     const script = `
-importScripts('https://www.gstatic.com/firebasejs/11.10.0/firebase-app-compat.js');
-importScripts('https://www.gstatic.com/firebasejs/11.10.0/firebase-messaging-compat.js');
+self.addEventListener('install', function () {
+  self.skipWaiting();
+});
 
-const firebaseConfig = ${JSON.stringify(swFirebaseConfig)};
-if (firebaseConfig.apiKey && firebaseConfig.projectId) {
-  firebase.initializeApp(firebaseConfig);
-  const messaging = firebase.messaging();
-  messaging.onBackgroundMessage(function () {
-    return self.registration.showNotification('NotePad', {
-      body: 'You have a new note reminder',
-      icon: '/pwa-192x192.png',
-      badge: '/pwa-192x192.png',
-      tag: 'notepad-reminder',
-      renotify: true,
-      data: { url: '/' }
-    });
-  });
-}
+self.addEventListener('activate', function (event) {
+  event.waitUntil(self.clients.claim());
+});
+
+self.addEventListener('push', function (event) {
+  var payload = {};
+  if (event.data) {
+    try {
+      payload = event.data.json();
+    } catch (e) {
+      try {
+        payload = { data: { body: event.data.text() } };
+      } catch (err) {}
+    }
+  }
+  var notif = payload.notification || payload.data || {};
+  var title = notif.title || 'NotePad';
+  var body = notif.body || 'You have a new note reminder';
+  var url = (payload.data && payload.data.url) || (payload.fcmOptions && payload.fcmOptions.link) || '/';
+  var ua = (self.navigator && self.navigator.userAgent ? self.navigator.userAgent : '').toLowerCase();
+  var isIOS = /iphone|ipad|ipod/.test(ua);
+
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (clientList) {
+      var hasActiveVisible = false;
+      for (var i = 0; i < clientList.length; i++) {
+        var client = clientList[i];
+        try {
+          client.postMessage({ type: 'NOTEPAD_PUSH_REMINDER', payload: payload });
+        } catch (err) {}
+        if (client.visibilityState === 'visible' && client.focused) {
+          hasActiveVisible = true;
+        }
+      }
+      if (isIOS || !hasActiveVisible) {
+        return self.registration.showNotification(title, {
+          body: body,
+          icon: '/pwa-192x192.png',
+          badge: '/pwa-192x192.png',
+          tag: 'notepad-reminder-' + Date.now(),
+          renotify: true,
+          data: { url: url }
+        });
+      }
+    })
+  );
+});
 
 self.addEventListener('notificationclick', function (event) {
   event.notification.close();
+  var targetUrl = (event.notification && event.notification.data && event.notification.data.url) || '/';
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (clientList) {
-      for (const client of clientList) {
+      for (var i = 0; i < clientList.length; i++) {
+        var client = clientList[i];
         if ('focus' in client) return client.focus();
       }
-      if (self.clients.openWindow) return self.clients.openWindow('/');
+      if (self.clients.openWindow) return self.clients.openWindow(targetUrl);
     })
   );
 });
@@ -254,11 +268,17 @@ self.addEventListener('notificationclick', function (event) {
         return;
       }
 
+      const tagId = `notepad-reminder-${Date.now()}`;
       await getAdminMessaging(adminApp).send({
         token: fcmToken,
         notification: {
           title: 'NotePad',
           body: 'You have a new note reminder',
+        },
+        data: {
+          title: 'NotePad',
+          body: 'You have a new note reminder',
+          url: '/',
         },
         webpush: {
           headers: {
@@ -270,7 +290,7 @@ self.addEventListener('notificationclick', function (event) {
             body: 'You have a new note reminder',
             icon: '/pwa-192x192.png',
             badge: '/pwa-192x192.png',
-            tag: 'notepad-reminder',
+            tag: tagId,
             renotify: true,
           },
           fcmOptions: {
@@ -280,9 +300,26 @@ self.addEventListener('notificationclick', function (event) {
       });
 
       res.json({ ok: true, pushed: true });
-    } catch {
-      // Gracefully report when IAM permissions for ADC are not granted yet
-      res.json({ ok: true, pushed: false, reason: 'push_unavailable' });
+    } catch (err: unknown) {
+      const errCode =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? String((err as { code: unknown }).code)
+          : 'push_unavailable';
+      if (
+        errCode === 'messaging/registration-token-not-registered' ||
+        errCode === 'messaging/invalid-registration-token'
+      ) {
+        try {
+          await getAdminFirestore(adminApp)
+            .collection('users')
+            .doc(toUserId)
+            .set({ fcmToken: null }, { merge: true });
+        } catch {
+          // Ignore cleanup error
+        }
+      }
+      console.warn('FCM reminder send skipped:', errCode);
+      res.json({ ok: true, pushed: false, reason: errCode });
     }
   });
 

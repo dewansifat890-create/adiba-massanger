@@ -15,7 +15,6 @@ import {
   Reply,
   RotateCcw,
   Search,
-  Trash2,
   User,
   UserPlus,
   X,
@@ -49,6 +48,7 @@ interface MessengerWindowProps {
     query?: string;
   };
   notificationsEnabled: boolean;
+  pushTokenReady?: boolean;
   accent: AccentColor;
   fontStyle: FontStyle;
   isMobileFrame: boolean;
@@ -60,7 +60,7 @@ interface MessengerWindowProps {
   onLookupUser: (query: string) => void;
   onResetLookup: () => void;
   onAddContact: (user: MessengerUser) => void;
-  onRemoveContact: (userId: string) => void;
+  onRemoveContact?: (userId: string) => void;
   onOpenChat: (peerId: string) => void;
   onCloseChat: () => void;
   onSendMessage: (
@@ -150,6 +150,7 @@ export function MessengerWindow({
   isAnonymousUser = true,
   lookupResult,
   notificationsEnabled,
+  pushTokenReady = false,
   accent,
   fontStyle,
   isMobileFrame,
@@ -161,7 +162,6 @@ export function MessengerWindow({
   onLookupUser,
   onResetLookup,
   onAddContact,
-  onRemoveContact,
   onOpenChat,
   onCloseChat,
   onSendMessage,
@@ -1243,7 +1243,7 @@ export function MessengerWindow({
               return (
                 <div
                   key={peer.userId}
-                  className="flex items-center justify-between gap-2 pr-2 hover:bg-slate-50 dark:hover:bg-white/[0.03] transition-colors"
+                  className="flex items-center hover:bg-slate-50 dark:hover:bg-white/[0.03] transition-colors"
                 >
                   <button
                     type="button"
@@ -1306,15 +1306,6 @@ export function MessengerWindow({
                         )}
                       </div>
                     </div>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() => onRemoveContact(peer.userId)}
-                    aria-label={`Remove ${peer.displayName}`}
-                    className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-full text-slate-400 hover:text-rose-500"
-                  >
-                    <Trash2 className="w-4 h-4" />
                   </button>
                 </div>
               );
@@ -1653,15 +1644,22 @@ export function MessengerWindow({
                 type="button"
                 onClick={onToggleNotifications}
                 className={`w-full min-h-[44px] rounded-xl text-sm font-semibold flex items-center justify-center gap-2 ${
-                  notificationsEnabled
+                  notificationsEnabled && pushTokenReady
                     ? 'bg-emerald-600 text-white'
+                    : notificationsEnabled
+                    ? 'bg-amber-500 text-black'
                     : 'bg-blue-600 text-white'
                 }`}
               >
-                {notificationsEnabled ? (
+                {notificationsEnabled && pushTokenReady ? (
                   <>
                     <Check className="w-4 h-4" />
-                    <span>Notifications Active</span>
+                    <span>Background Push Active</span>
+                  </>
+                ) : notificationsEnabled ? (
+                  <>
+                    <BellRing className="w-4 h-4" />
+                    <span>Retry Background Push Setup</span>
                   </>
                 ) : (
                   <>
