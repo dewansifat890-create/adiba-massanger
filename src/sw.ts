@@ -60,12 +60,64 @@ interface SWGlobalScope {
 
 declare const self: SWGlobalScope;
 
+const PREFS_CACHE_NAME = 'notepad-prefs-v1';
+const MUTE_PREF_KEY = '/__mute_pref__';
+const ACTIVE_CHAT_KEY = '/__active_chat__';
+const recentNotifiedIds = new Set<string>();
+
+function rememberNotifiedId(id: string): void {
+  if (!id) return;
+  recentNotifiedIds.add(id);
+  if (recentNotifiedIds.size > 200) {
+    const oldest = recentNotifiedIds.values().next().value;
+    if (oldest) recentNotifiedIds.delete(oldest);
+  }
+}
+
+async function readMutePref(): Promise<boolean> {
+  try {
+    const cache = await caches.open(PREFS_CACHE_NAME);
+    const res = await cache.match(MUTE_PREF_KEY);
+    if (!res) return false;
+    return (await res.text()) === '1';
+  } catch {
+    return false;
+  }
+}
+
+async function readActiveChatPref(): Promise<{
+  peerId: string | null;
+  visible: boolean;
+}> {
+  try {
+    const cache = await caches.open(PREFS_CACHE_NAME);
+    const res = await cache.match(ACTIVE_CHAT_KEY);
+    if (!res) return { peerId: null, visible: false };
+    const parsed = (await res.json()) as {
+      peerId?: string | null;
+      visible?: boolean;
+    };
+    return {
+      peerId: typeof parsed.peerId === 'string' ? parsed.peerId : null,
+      visible: Boolean(parsed.visible),
+    };
+  } catch {
+    return { peerId: null, visible: false };
+  }
+}
+
 // Register push & notificationclick SYNCHRONOUSLY at top-level so background wakes
 // on iOS PWA and Android Chrome always deliver notifications when the app is closed.
 self.addEventListener('push', (event: SWPushEvent) => {
   let payload: {
     notification?: { title?: string; body?: string; icon?: string; badge?: string };
-    data?: { title?: string; body?: string; url?: string };
+    data?: {
+      title?: string;
+      body?: string;
+      url?: string;
+      fromUserId?: string;
+      messageId?: string;
+    };
     fcmOptions?: { link?: string };
   } = {};
 
@@ -91,38 +143,78 @@ self.addEventListener('push', (event: SWPushEvent) => {
     payload.data?.body ||
     'You have a new note reminder';
   const url = payload.data?.url || payload.fcmOptions?.link || '/';
+  const fromUserId = payload.data?.fromUserId || '';
+  const messageId = payload.data?.messageId || '';
   const ua = (self.navigator?.userAgent || '').toLowerCase();
   const isIOS = /iphone|ipad|ipod/.test(ua);
 
   event.waitUntil(
-    self.clients
-      .matchAll({ type: 'window', includeUncontrolled: true })
-      .then((clientList) => {
-        let hasActiveVisibleClient = false;
-        for (const client of clientList) {
-          try {
-            client.postMessage({ type: 'NOTEPAD_PUSH_REMINDER', payload });
-          } catch {
-            // Ignore postMessage failure
-          }
-          if (client.visibilityState === 'visible' && client.focused) {
+    Promise.all([
+      self.clients.matchAll({ type: 'window', includeUncontrolled: true }),
+      readMutePref(),
+      readActiveChatPref(),
+    ]).then(([clientList, isMuted, activeChat]) => {
+      if (messageId && recentNotifiedIds.has(messageId)) {
+        return undefined;
+      }
+
+      let hasVisibleClient = false;
+      let hasActiveVisibleClient = false;
+      for (const client of clientList) {
+        if (client.visibilityState === 'visible') {
+          hasVisibleClient = true;
+          if (client.focused) {
             hasActiveVisibleClient = true;
           }
         }
+      }
 
-        // Apple WebKit revokes Web Push permission if any push event skips showNotification.
-        // On Android/Desktop, always show when app is closed, minimized, or screen is off.
-        if (isIOS || !hasActiveVisibleClient) {
-          return self.registration.showNotification(title, {
-            body,
-            icon: '/pwa-192x192.png',
-            badge: '/pwa-192x192.png',
-            tag: `notepad-reminder-${Date.now()}`,
-            data: { url },
-          });
-        }
+      const isViewingSenderChat =
+        hasVisibleClient &&
+        Boolean(fromUserId) &&
+        activeChat.visible &&
+        activeChat.peerId === fromUserId;
+
+      if (isViewingSenderChat) {
+        if (messageId) rememberNotifiedId(messageId);
         return undefined;
-      })
+      }
+
+      const willShowInSw = isIOS || !hasActiveVisibleClient;
+
+      for (const client of clientList) {
+        try {
+          client.postMessage({
+            type: 'NOTEPAD_PUSH_REMINDER',
+            payload,
+            shownInSw: willShowInSw,
+          });
+        } catch {
+          // Ignore postMessage failure
+        }
+      }
+
+      if (messageId) {
+        rememberNotifiedId(messageId);
+      }
+
+      // Apple WebKit revokes Web Push permission if background push skips showNotification.
+      // On Android/Desktop, show whenever app is closed, minimized, or screen is off.
+      if (willShowInSw) {
+        const notifTag = messageId
+          ? `notepad-msg-${messageId}`
+          : `notepad-reminder-${Date.now()}`;
+        return self.registration.showNotification(title, {
+          body,
+          icon: '/pwa-192x192.png',
+          badge: '/pwa-192x192.png',
+          tag: notifTag,
+          silent: isMuted,
+          data: { url, fromUserId, messageId },
+        });
+      }
+      return undefined;
+    })
   );
 });
 
@@ -151,8 +243,44 @@ self.addEventListener('activate', (event: SWExtendableEvent) => {
 });
 
 self.addEventListener('message', (event: SWMessageEvent) => {
-  if (event.data && (event.data as { type?: string }).type === 'SKIP_WAITING') {
+  const data = event.data as
+    | {
+        type?: string;
+        muted?: boolean;
+        peerId?: string | null;
+        visible?: boolean;
+        messageId?: string;
+      }
+    | undefined;
+  if (!data) return;
+  if (data.type === 'SKIP_WAITING') {
     void self.skipWaiting();
+  } else if (data.type === 'MARK_NOTIFIED' && typeof data.messageId === 'string') {
+    rememberNotifiedId(data.messageId);
+  } else if (data.type === 'SET_MUTE_PREF') {
+    event.waitUntil(
+      caches
+        .open(PREFS_CACHE_NAME)
+        .then((c) => c.put(MUTE_PREF_KEY, new Response(data.muted ? '1' : '0')))
+        .catch(() => {})
+    );
+  } else if (data.type === 'SET_ACTIVE_CHAT') {
+    event.waitUntil(
+      caches
+        .open(PREFS_CACHE_NAME)
+        .then((c) =>
+          c.put(
+            ACTIVE_CHAT_KEY,
+            new Response(
+              JSON.stringify({
+                peerId: data.peerId || null,
+                visible: Boolean(data.visible),
+              })
+            )
+          )
+        )
+        .catch(() => {})
+    );
   }
 });
 

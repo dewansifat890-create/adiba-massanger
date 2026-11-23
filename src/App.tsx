@@ -31,6 +31,7 @@ import {
   lookupFirebaseUser,
   markFirebaseChatDelivered,
   markFirebaseChatSeen,
+  markMessageNotifiedInSw,
   registerFirebasePushNotifications,
   sendFirebaseDirectMessage,
   sendFirebaseTypingStatus,
@@ -40,8 +41,11 @@ import {
   startFirebasePresence,
   subscribeToFirebaseChats,
   subscribeToPeerPresence,
+  syncActiveChatToSw,
   syncFirebaseUserProfile,
+  syncMutePrefToSw,
   toggleFirebaseMessageReaction,
+  warmupPushEndpoint,
 } from './services/firebaseMessenger';
 import {
   createInitialNotes,
@@ -72,6 +76,7 @@ const MESSENGER_USER_KEY = 'notepad_messenger_user_v1';
 const MESSENGER_CONTACTS_KEY = 'notepad_messenger_contacts_v1';
 const MESSENGER_CONVS_KEY = 'notepad_messenger_convs_v1';
 const NOTIF_PROMPT_DONE_KEY = 'notepad_notif_prompt_done_v1';
+const MESSAGES_MUTED_KEY = 'notepad_messages_muted_v1';
 const LEGACY_DEMO_USER_ID = 'demo-user';
 
 function loadNotes(): Note[] {
@@ -210,6 +215,13 @@ export default function App() {
   const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(() => {
     return typeof Notification !== 'undefined' && Notification.permission === 'granted';
   });
+  const [messagesMuted, setMessagesMuted] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(MESSAGES_MUTED_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
   const [pushTokenReady, setPushTokenReady] = useState<boolean>(false);
   const [showNotifPrompt, setShowNotifPrompt] = useState<boolean>(() => {
     try {
@@ -232,13 +244,17 @@ export default function App() {
   const deliveredMarkRef = useRef<Record<string, number>>({});
   const seenMarkRef = useRef<Record<string, number>>({});
   const fcmTokenSavedRef = useRef<string | null>(null);
+  const lastReminderAtRef = useRef<number>(0);
+  const notifiedMsgIdsRef = useRef<Set<string>>(new Set());
   const screenRef = useRef<AppScreen>(screen);
   const activeChatPeerRef = useRef<string | null>(activeChatPeerId);
   const notificationsEnabledRef = useRef<boolean>(notificationsEnabled);
+  const messagesMutedRef = useRef<boolean>(messagesMuted);
 
   screenRef.current = screen;
   activeChatPeerRef.current = activeChatPeerId;
   notificationsEnabledRef.current = notificationsEnabled;
+  messagesMutedRef.current = messagesMuted;
 
   const [isCompactViewport, setIsCompactViewport] = useState<boolean>(() =>
     typeof window !== 'undefined' ? window.innerWidth < 768 : false
@@ -339,18 +355,124 @@ export default function App() {
     setToast({ message, undoNoteId });
   };
 
-  const triggerDisguisedReminder = () => {
+  // Persist mute preference and sync to Service Worker cache
+  useEffect(() => {
+    try {
+      localStorage.setItem(MESSAGES_MUTED_KEY, messagesMuted ? '1' : '0');
+    } catch {
+      // Ignore storage quota errors
+    }
+    syncMutePrefToSw(messagesMuted);
+  }, [messagesMuted]);
+
+  // Keep Service Worker aware of which chat box is currently open on screen
+  useEffect(() => {
+    const syncState = () => {
+      const visible =
+        document.visibilityState === 'visible' &&
+        screen.type === 'messenger' &&
+        Boolean(activeChatPeerId);
+      syncActiveChatToSw(visible ? activeChatPeerId : null, visible);
+    };
+    const handleHide = () => syncActiveChatToSw(null, false);
+    syncState();
+    document.addEventListener('visibilitychange', syncState);
+    window.addEventListener('pageshow', syncState);
+    window.addEventListener('pagehide', handleHide);
+    return () => {
+      document.removeEventListener('visibilitychange', syncState);
+      window.removeEventListener('pageshow', syncState);
+      window.removeEventListener('pagehide', handleHide);
+    };
+  }, [screen.type, activeChatPeerId]);
+
+  const playReminderChime = () => {
+    if (messagesMutedRef.current || typeof window === 'undefined') return;
+    try {
+      const AudioCtx =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext?: typeof AudioContext })
+          .webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const now = ctx.currentTime;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(784, now);
+      osc.frequency.setValueAtTime(988, now + 0.09);
+      gain.gain.setValueAtTime(0.001, now);
+      gain.gain.exponentialRampToValueAtTime(0.08, now + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.28);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.3);
+      window.setTimeout(() => {
+        void ctx.close().catch(() => {});
+      }, 400);
+    } catch {
+      // Ignore audio errors when autoplay is restricted
+    }
+  };
+
+  const triggerDisguisedReminder = (
+    fromPeerId?: string,
+    forceTest = false,
+    messageId?: string,
+    shownInSw = false
+  ) => {
+    if (!forceTest) {
+      const isViewingSenderChat =
+        document.visibilityState === 'visible' &&
+        screenRef.current.type === 'messenger' &&
+        Boolean(activeChatPeerRef.current) &&
+        (!fromPeerId || activeChatPeerRef.current === fromPeerId);
+      if (isViewingSenderChat) {
+        if (messageId) markMessageNotifiedInSw(messageId);
+        return;
+      }
+
+      if (messageId) {
+        if (notifiedMsgIdsRef.current.has(messageId)) {
+          return;
+        }
+        notifiedMsgIdsRef.current.add(messageId);
+        if (notifiedMsgIdsRef.current.size > 200) {
+          const first = notifiedMsgIdsRef.current.values().next().value;
+          if (first) notifiedMsgIdsRef.current.delete(first);
+        }
+        markMessageNotifiedInSw(messageId);
+      } else {
+        const now = Date.now();
+        if (now - lastReminderAtRef.current < 3500) {
+          return;
+        }
+        lastReminderAtRef.current = now;
+      }
+    }
+
     setReminderBannerVisible(true);
+    if (shownInSw) {
+      return;
+    }
+
+    if (!messagesMutedRef.current) {
+      playReminderChime();
+    }
+
     if (
       notificationsEnabledRef.current &&
       typeof Notification !== 'undefined' &&
       Notification.permission === 'granted'
     ) {
+      const isMuted = messagesMutedRef.current;
       const options: NotificationOptions = {
         body: 'You have a new note reminder',
         icon: '/pwa-192x192.png',
         badge: '/pwa-192x192.png',
-        tag: 'notepad-reminder',
+        tag: messageId ? `notepad-msg-${messageId}` : 'notepad-reminder',
+        silent: isMuted,
       };
       try {
         new Notification('NotePad', options);
@@ -395,8 +517,15 @@ export default function App() {
       }
     });
 
-    void attachForegroundMessageListener(() => {
-      if (!cancelled) triggerDisguisedReminder();
+    void attachForegroundMessageListener((meta) => {
+      if (!cancelled) {
+        triggerDisguisedReminder(
+          meta?.fromUserId,
+          false,
+          meta?.messageId,
+          meta?.shownInSw
+        );
+      }
     }).then((unsub) => {
       if (cancelled) unsub();
       else unsubForegroundPush = unsub;
@@ -511,18 +640,21 @@ export default function App() {
               }
             }
           },
-          onNewIncomingMessage: (peerId) => {
+          onNewIncomingMessage: (peerId, msg) => {
             if (cancelled) return;
             const isViewingThisThread =
               screenRef.current.type === 'messenger' &&
-              activeChatPeerRef.current === peerId;
+              activeChatPeerRef.current === peerId &&
+              document.visibilityState === 'visible';
 
             if (!isViewingThisThread) {
               setUnreadCounts((prev) => ({
                 ...prev,
                 [peerId]: (prev[peerId] ?? 0) + 1,
               }));
-              triggerDisguisedReminder();
+              triggerDisguisedReminder(peerId, false, msg.id);
+            } else {
+              markMessageNotifiedInSw(msg.id);
             }
           },
           onChatMetaUpdate: (dmId, peerId, meta) => {
@@ -841,7 +973,8 @@ export default function App() {
 
               const isViewingThisThread =
                 screenRef.current.type === 'messenger' &&
-                activeChatPeerRef.current === msg.fromUserId;
+                activeChatPeerRef.current === msg.fromUserId &&
+                document.visibilityState === 'visible';
 
               if (isViewingThisThread && wsRef.current?.readyState === WebSocket.OPEN) {
                 wsRef.current.send(
@@ -852,7 +985,7 @@ export default function App() {
                   ...prev,
                   [msg.fromUserId]: (prev[msg.fromUserId] ?? 0) + 1,
                 }));
-                triggerDisguisedReminder();
+                triggerDisguisedReminder(msg.fromUserId, false, msg.id);
               }
             }
           } else if (data.type === 'dm:updated' && data.dmId && data.message) {
@@ -1310,6 +1443,7 @@ export default function App() {
           isAnonymousUser={isAnonymousUser}
           lookupResult={lookupResult}
           notificationsEnabled={notificationsEnabled}
+          messagesMuted={messagesMuted}
           pushTokenReady={pushTokenReady}
           accent={settings.accent}
           fontStyle={settings.fontStyle}
@@ -1433,12 +1567,20 @@ export default function App() {
               delete next[peerId];
               return next;
             });
+            if (firebaseStatus === 'ready') {
+              void warmupPushEndpoint(peerId);
+            }
             if (wsRef.current?.readyState === WebSocket.OPEN) {
               wsRef.current.send(JSON.stringify({ type: 'dm:join', peerId }));
             }
           }}
           onCloseChat={() => setActiveChatPeerId(null)}
-          onSendMessage={(toUserId, text, replyTo?: ChatReplyPreview) => {
+          onSendMessage={(
+            toUserId,
+            text,
+            replyTo?: ChatReplyPreview,
+            imageUrl?: string
+          ) => {
             const dmId = makeDmId(messengerUser.userId, toUserId);
             const messageId = generateId();
             const msg: DirectMessage = {
@@ -1448,6 +1590,7 @@ export default function App() {
               toUserId,
               senderName: messengerUser.displayName,
               text,
+              ...(imageUrl ? { imageUrl } : {}),
               createdAt: Date.now(),
               replyTo,
               reactions: [],
@@ -1467,6 +1610,7 @@ export default function App() {
                 peerUid: toUserId,
                 text,
                 messageId,
+                imageUrl,
                 replyTo,
                 chatAlreadyExists: knownFirebaseChatsRef.current.has(dmId),
               })
@@ -1474,8 +1618,8 @@ export default function App() {
                   setFirebaseStatus('ready');
                 })
                 .catch((err) => {
-                  const msg = err instanceof Error ? err.message : '';
-                  if (msg.toLowerCase().includes('permission')) {
+                  const errMsg = err instanceof Error ? err.message : '';
+                  if (errMsg.toLowerCase().includes('permission')) {
                     setFirebaseStatus('permission-denied');
                   }
                   showToast('Failed to send via Firebase');
@@ -1555,6 +1699,7 @@ export default function App() {
                   ? {
                       ...m,
                       text: '',
+                      imageUrl: undefined,
                       unsent: true,
                       unsentAt: now,
                       replyTo: undefined,
@@ -1600,7 +1745,14 @@ export default function App() {
             }
           }}
           onToggleNotifications={handleToggleNotifications}
-          onTestReminder={() => triggerDisguisedReminder()}
+          onToggleMute={() => {
+            setMessagesMuted((prev) => {
+              const next = !prev;
+              showToast(next ? 'Messages muted (no sound)' : 'Message sound enabled');
+              return next;
+            });
+          }}
+          onTestReminder={() => triggerDisguisedReminder(undefined, true)}
           onShowToast={(msg) => showToast(msg)}
         />
       ) : screen.type === 'settings' ? (

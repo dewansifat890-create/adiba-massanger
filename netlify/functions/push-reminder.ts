@@ -17,6 +17,11 @@ interface CachedCerts {
   expiresAt: number;
 }
 
+interface CachedEntry<T> {
+  value: T;
+  expiresAt: number;
+}
+
 const GOOGLE_CERTS_URL =
   'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com';
 const OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -25,8 +30,12 @@ const OAUTH_SCOPES = [
   'https://www.googleapis.com/auth/firebase.messaging',
 ].join(' ');
 
+const WARM_TTL_MS = 45_000;
+
 let cachedAccessToken: CachedAccessToken | null = null;
 let cachedCerts: CachedCerts | null = null;
+const chatAuthCache = new Map<string, CachedEntry<boolean>>();
+const fcmTokenCache = new Map<string, CachedEntry<string>>();
 
 function makeDmId(userA: string, userB: string): string {
   return [userA, userB].sort().join('__');
@@ -322,6 +331,7 @@ async function clearUserFcmToken(
   accessToken: string,
   userId: string
 ): Promise<void> {
+  fcmTokenCache.delete(userId);
   const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
     projectId
   )}/databases/(default)/documents/users/${encodeURIComponent(
@@ -340,6 +350,83 @@ async function clearUserFcmToken(
       },
     }),
   });
+}
+
+async function resolveChatAndToken(
+  projectId: string,
+  accessToken: string,
+  callerUid: string,
+  toUserId: string
+): Promise<{
+  allowed: boolean;
+  notFound?: boolean;
+  fcmToken?: string;
+}> {
+  const now = Date.now();
+  const chatId = makeDmId(callerUid, toUserId);
+  const authKey = `${callerUid}:${chatId}`;
+  const cachedAllowed = chatAuthCache.get(authKey);
+  const cachedToken = fcmTokenCache.get(toUserId);
+
+  const hasWarmAuth = Boolean(cachedAllowed && cachedAllowed.expiresAt > now);
+  const hasWarmToken = Boolean(cachedToken && cachedToken.expiresAt > now);
+
+  if (hasWarmAuth && hasWarmToken) {
+    return {
+      allowed: Boolean(cachedAllowed!.value),
+      fcmToken: cachedToken!.value,
+    };
+  }
+
+  let [chatDoc, recipientDoc] = await Promise.all([
+    hasWarmAuth
+      ? Promise.resolve(null)
+      : getFirestoreDoc(projectId, accessToken, `chats/${encodeURIComponent(chatId)}`),
+    hasWarmToken
+      ? Promise.resolve(null)
+      : getFirestoreDoc(projectId, accessToken, `users/${encodeURIComponent(toUserId)}`),
+  ]);
+
+  if (!hasWarmAuth && !chatDoc) {
+    // Brief single retry in case first-ever chat creation write is finishing concurrently
+    await new Promise((r) => setTimeout(r, 180));
+    chatDoc = await getFirestoreDoc(
+      projectId,
+      accessToken,
+      `chats/${encodeURIComponent(chatId)}`
+    );
+  }
+
+  let allowed = hasWarmAuth ? Boolean(cachedAllowed!.value) : false;
+  if (!hasWarmAuth) {
+    if (!chatDoc) {
+      return { allowed: false, notFound: true };
+    }
+    const participantValues =
+      chatDoc.fields?.participants?.arrayValue?.values || [];
+    const participants = participantValues
+      .map((v) => v.stringValue)
+      .filter((v): v is string => typeof v === 'string');
+    allowed = participants.includes(callerUid) && participants.includes(toUserId);
+    if (allowed) {
+      chatAuthCache.set(authKey, { value: true, expiresAt: now + WARM_TTL_MS });
+    }
+  }
+
+  if (!allowed) {
+    return { allowed: false };
+  }
+
+  let fcmToken = hasWarmToken ? cachedToken!.value : undefined;
+  if (!hasWarmToken) {
+    const rawToken = recipientDoc?.fields?.fcmToken?.stringValue;
+    if (typeof rawToken === 'string' && rawToken) {
+      fcmToken = rawToken;
+      fcmTokenCache.set(toUserId, { value: rawToken, expiresAt: now + WARM_TTL_MS });
+    }
+  }
+
+  return { allowed: true, fcmToken };
 }
 
 export default async (req: Request): Promise<Response> => {
@@ -367,60 +454,74 @@ export default async (req: Request): Promise<Response> => {
     return jsonResponse({ ok: false, error: 'Missing bearer token' }, 401);
   }
 
-  let callerUid = '';
+  let bodyData: { toUserId?: unknown; messageId?: unknown; warmup?: unknown } = {};
   try {
-    callerUid = await verifyFirebaseIdToken(token, sa.projectId);
-  } catch {
-    return jsonResponse({ ok: false, error: 'Invalid auth token' }, 401);
-  }
-
-  let bodyData: { toUserId?: unknown } = {};
-  try {
-    bodyData = (await req.json()) as { toUserId?: unknown };
+    bodyData = (await req.json()) as {
+      toUserId?: unknown;
+      messageId?: unknown;
+      warmup?: unknown;
+    };
   } catch {
     return jsonResponse({ ok: false, error: 'Invalid JSON body' }, 400);
   }
 
+  // Run Firebase ID token verification & Google OAuth access token minting in parallel
+  let callerUid = '';
+  let accessToken = '';
+  try {
+    [callerUid, accessToken] = await Promise.all([
+      verifyFirebaseIdToken(token, sa.projectId),
+      getGoogleAccessToken(sa),
+    ]);
+  } catch {
+    return jsonResponse({ ok: false, error: 'Invalid auth token' }, 401);
+  }
+
   const toUserId =
     typeof bodyData?.toUserId === 'string' ? bodyData.toUserId.trim() : '';
+
+  // Handle pre-warm ping while user opens chat / types so Send fires with 0 cold start
+  if (bodyData?.warmup === true) {
+    if (/^[A-Za-z0-9_-]{4,128}$/.test(toUserId) && toUserId !== callerUid) {
+      await resolveChatAndToken(sa.projectId, accessToken, callerUid, toUserId).catch(
+        () => {}
+      );
+    }
+    return jsonResponse({ ok: true, warmed: true });
+  }
+
   if (!/^[A-Za-z0-9_-]{4,128}$/.test(toUserId) || toUserId === callerUid) {
     return jsonResponse({ ok: false, error: 'Invalid recipient' }, 400);
   }
 
+  const rawMsgId =
+    typeof bodyData?.messageId === 'string' ? bodyData.messageId.trim() : '';
+  const cleanMsgId = /^[A-Za-z0-9_-]{4,128}$/.test(rawMsgId) ? rawMsgId : '';
+
   try {
-    const accessToken = await getGoogleAccessToken(sa);
-    const chatId = makeDmId(callerUid, toUserId);
-
-    const chatDoc = await getFirestoreDoc(
+    const resolved = await resolveChatAndToken(
       sa.projectId,
       accessToken,
-      `chats/${encodeURIComponent(chatId)}`
+      callerUid,
+      toUserId
     );
-    if (!chatDoc) {
-      return jsonResponse({ ok: false, error: 'Not a participant' }, 403);
+    if (!resolved.allowed) {
+      return jsonResponse(
+        {
+          ok: false,
+          error: resolved.notFound ? 'Not a participant' : 'Access denied',
+        },
+        403
+      );
     }
 
-    const participantValues =
-      chatDoc.fields?.participants?.arrayValue?.values || [];
-    const participants = participantValues
-      .map((v) => v.stringValue)
-      .filter((v): v is string => typeof v === 'string');
-
-    if (!participants.includes(callerUid) || !participants.includes(toUserId)) {
-      return jsonResponse({ ok: false, error: 'Access denied' }, 403);
-    }
-
-    const recipientDoc = await getFirestoreDoc(
-      sa.projectId,
-      accessToken,
-      `users/${encodeURIComponent(toUserId)}`
-    );
-    const fcmToken = recipientDoc?.fields?.fcmToken?.stringValue;
-    if (typeof fcmToken !== 'string' || !fcmToken) {
+    if (!resolved.fcmToken) {
       return jsonResponse({ ok: true, pushed: false, reason: 'no_fcm_token' });
     }
 
-    const tagId = `notepad-reminder-${Date.now()}`;
+    const tagId = cleanMsgId
+      ? `notepad-msg-${cleanMsgId}`
+      : `notepad-reminder-${Date.now()}`;
     const fcmUrl = `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(
       sa.projectId
     )}/messages:send`;
@@ -433,7 +534,7 @@ export default async (req: Request): Promise<Response> => {
       },
       body: JSON.stringify({
         message: {
-          token: fcmToken,
+          token: resolved.fcmToken,
           notification: {
             title: 'NotePad',
             body: 'You have a new note reminder',
@@ -442,6 +543,8 @@ export default async (req: Request): Promise<Response> => {
             title: 'NotePad',
             body: 'You have a new note reminder',
             url: '/',
+            fromUserId: callerUid,
+            ...(cleanMsgId ? { messageId: cleanMsgId } : {}),
           },
           android: {
             priority: 'HIGH',
@@ -467,7 +570,7 @@ export default async (req: Request): Promise<Response> => {
               icon: '/pwa-192x192.png',
               badge: '/pwa-192x192.png',
               tag: tagId,
-              renotify: true,
+              renotify: false,
             },
             fcm_options: {
               link: '/',

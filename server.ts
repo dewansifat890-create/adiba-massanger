@@ -36,6 +36,7 @@ interface DirectMessage {
   toUserId: string;
   senderName: string;
   text: string;
+  imageUrl?: string;
   createdAt: number;
   deliveredAt?: number;
   seenAt?: number;
@@ -123,7 +124,7 @@ async function startServer() {
     }
   });
 
-  app.use(express.json());
+  app.use(express.json({ limit: '2mb' }));
 
   const firebaseProjectId =
     process.env.VITE_FIREBASE_PROJECT_ID || 'adiba-massanger';
@@ -139,12 +140,57 @@ async function startServer() {
 
   app.get('/firebase-messaging-sw.js', (_req, res) => {
     const script = `
+var recentNotifiedIds = new Set();
+
+function rememberNotifiedId(id) {
+  if (!id) return;
+  recentNotifiedIds.add(id);
+  if (recentNotifiedIds.size > 200) {
+    var first = recentNotifiedIds.values().next().value;
+    if (first) recentNotifiedIds.delete(first);
+  }
+}
+
+function readPrefBool(key) {
+  return caches.open('notepad-prefs-v1').then(function (cache) {
+    return cache.match(key);
+  }).then(function (res) {
+    if (!res) return false;
+    return res.text().then(function (t) { return t === '1'; });
+  }).catch(function () { return false; });
+}
+
+function readActiveChat() {
+  return caches.open('notepad-prefs-v1').then(function (cache) {
+    return cache.match('/__active_chat__');
+  }).then(function (res) {
+    if (!res) return { peerId: null, visible: false };
+    return res.json();
+  }).catch(function () { return { peerId: null, visible: false }; });
+}
+
 self.addEventListener('install', function () {
   self.skipWaiting();
 });
 
 self.addEventListener('activate', function (event) {
   event.waitUntil(self.clients.claim());
+});
+
+self.addEventListener('message', function (event) {
+  var d = event.data;
+  if (!d || typeof d !== 'object') return;
+  if (d.type === 'MARK_NOTIFIED' && typeof d.messageId === 'string') {
+    rememberNotifiedId(d.messageId);
+  } else if (d.type === 'SET_MUTE_PREF') {
+    event.waitUntil(caches.open('notepad-prefs-v1').then(function (c) {
+      return c.put('/__mute_pref__', new Response(d.muted ? '1' : '0'));
+    }).catch(function () {}));
+  } else if (d.type === 'SET_ACTIVE_CHAT') {
+    event.waitUntil(caches.open('notepad-prefs-v1').then(function (c) {
+      return c.put('/__active_chat__', new Response(JSON.stringify({ peerId: d.peerId || null, visible: Boolean(d.visible) })));
+    }).catch(function () {}));
+  }
 });
 
 self.addEventListener('push', function (event) {
@@ -162,29 +208,54 @@ self.addEventListener('push', function (event) {
   var title = notif.title || 'NotePad';
   var body = notif.body || 'You have a new note reminder';
   var url = (payload.data && payload.data.url) || (payload.fcmOptions && payload.fcmOptions.link) || '/';
+  var fromUserId = (payload.data && payload.data.fromUserId) || '';
+  var messageId = (payload.data && payload.data.messageId) || '';
   var ua = (self.navigator && self.navigator.userAgent ? self.navigator.userAgent : '').toLowerCase();
   var isIOS = /iphone|ipad|ipod/.test(ua);
 
   event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (clientList) {
+    Promise.all([
+      self.clients.matchAll({ type: 'window', includeUncontrolled: true }),
+      readPrefBool('/__mute_pref__'),
+      readActiveChat()
+    ]).then(function (results) {
+      if (messageId && recentNotifiedIds.has(messageId)) {
+        return undefined;
+      }
+      var clientList = results[0];
+      var isMuted = results[1];
+      var activeChat = results[2] || {};
+      var hasVisibleClient = false;
       var hasActiveVisible = false;
       for (var i = 0; i < clientList.length; i++) {
         var client = clientList[i];
-        try {
-          client.postMessage({ type: 'NOTEPAD_PUSH_REMINDER', payload: payload });
-        } catch (err) {}
-        if (client.visibilityState === 'visible' && client.focused) {
-          hasActiveVisible = true;
+        if (client.visibilityState === 'visible') {
+          hasVisibleClient = true;
+          if (client.focused) hasActiveVisible = true;
         }
       }
-      if (isIOS || !hasActiveVisible) {
+      var isViewingSenderChat = hasVisibleClient && Boolean(fromUserId) && activeChat.visible === true && activeChat.peerId === fromUserId;
+      if (isViewingSenderChat) {
+        if (messageId) rememberNotifiedId(messageId);
+        return undefined;
+      }
+      var willShowInSw = isIOS || !hasActiveVisible;
+      for (var j = 0; j < clientList.length; j++) {
+        try {
+          clientList[j].postMessage({ type: 'NOTEPAD_PUSH_REMINDER', payload: payload, shownInSw: willShowInSw });
+        } catch (err) {}
+      }
+      if (messageId) rememberNotifiedId(messageId);
+      if (willShowInSw) {
+        var notifTag = messageId ? ('notepad-msg-' + messageId) : ('notepad-reminder-' + Date.now());
         return self.registration.showNotification(title, {
           body: body,
           icon: '/pwa-192x192.png',
           badge: '/pwa-192x192.png',
-          tag: 'notepad-reminder-' + Date.now(),
-          renotify: true,
-          data: { url: url }
+          tag: notifTag,
+          renotify: false,
+          silent: Boolean(isMuted),
+          data: { url: url, fromUserId: fromUserId, messageId: messageId }
         });
       }
     })
@@ -236,6 +307,11 @@ self.addEventListener('notificationclick', function (event) {
       return;
     }
 
+    if (req.body?.warmup === true) {
+      res.json({ ok: true, warmed: true });
+      return;
+    }
+
     const toUserId =
       typeof req.body?.toUserId === 'string' ? req.body.toUserId.trim() : '';
     if (!/^[A-Za-z0-9_-]{4,128}$/.test(toUserId) || toUserId === callerUid) {
@@ -243,10 +319,17 @@ self.addEventListener('notificationclick', function (event) {
       return;
     }
 
+    const rawMsgId =
+      typeof req.body?.messageId === 'string' ? req.body.messageId.trim() : '';
+    const cleanMsgId = /^[A-Za-z0-9_-]{4,128}$/.test(rawMsgId) ? rawMsgId : '';
+
     try {
       const adminDb = getAdminFirestore(adminApp);
       const chatId = makeDmId(callerUid, toUserId);
-      const chatDoc = await adminDb.collection('chats').doc(chatId).get();
+      const [chatDoc, recipientDoc] = await Promise.all([
+        adminDb.collection('chats').doc(chatId).get(),
+        adminDb.collection('users').doc(toUserId).get(),
+      ]);
       if (!chatDoc.exists) {
         res.status(403).json({ ok: false, error: 'Not a participant' });
         return;
@@ -261,14 +344,15 @@ self.addEventListener('notificationclick', function (event) {
         return;
       }
 
-      const recipientDoc = await adminDb.collection('users').doc(toUserId).get();
       const fcmToken = recipientDoc.data()?.fcmToken;
       if (typeof fcmToken !== 'string' || !fcmToken) {
         res.json({ ok: true, pushed: false, reason: 'no_fcm_token' });
         return;
       }
 
-      const tagId = `notepad-reminder-${Date.now()}`;
+      const tagId = cleanMsgId
+        ? `notepad-msg-${cleanMsgId}`
+        : `notepad-reminder-${Date.now()}`;
       await getAdminMessaging(adminApp).send({
         token: fcmToken,
         notification: {
@@ -279,6 +363,8 @@ self.addEventListener('notificationclick', function (event) {
           title: 'NotePad',
           body: 'You have a new note reminder',
           url: '/',
+          fromUserId: callerUid,
+          ...(cleanMsgId ? { messageId: cleanMsgId } : {}),
         },
         webpush: {
           headers: {
@@ -291,7 +377,7 @@ self.addEventListener('notificationclick', function (event) {
             icon: '/pwa-192x192.png',
             badge: '/pwa-192x192.png',
             tag: tagId,
-            renotify: true,
+            renotify: false,
           },
           fcmOptions: {
             link: '/',
@@ -320,6 +406,93 @@ self.addEventListener('notificationclick', function (event) {
       }
       console.warn('FCM reminder send skipped:', errCode);
       res.json({ ok: true, pushed: false, reason: errCode });
+    }
+  });
+
+  app.post('/api/upload-image', async (req, res) => {
+    const imgbbKey = process.env.IMGBB_API_KEY?.trim();
+    if (!imgbbKey) {
+      res.status(503).json({ ok: false, error: 'missing_imgbb_api_key' });
+      return;
+    }
+
+    if (adminApp) {
+      const authHeader = req.headers.authorization || '';
+      const token = authHeader.startsWith('Bearer ')
+        ? authHeader.slice('Bearer '.length).trim()
+        : '';
+      if (!token) {
+        res.status(401).json({ ok: false, error: 'Missing bearer token' });
+        return;
+      }
+      try {
+        await getAdminAuth(adminApp).verifyIdToken(token);
+      } catch {
+        res.status(401).json({ ok: false, error: 'Invalid auth token' });
+        return;
+      }
+    }
+
+    const rawBase64 =
+      typeof req.body?.imageBase64 === 'string'
+        ? req.body.imageBase64.trim()
+        : '';
+    const cleanBase64 = rawBase64.replace(
+      /^data:image\/[a-zA-Z0-9+.-]+;base64,/,
+      ''
+    );
+    if (!cleanBase64 || cleanBase64.length > 2_000_000) {
+      res
+        .status(400)
+        .json({ ok: false, error: 'Invalid or oversized image payload' });
+      return;
+    }
+
+    const cleanName =
+      typeof req.body?.name === 'string' && req.body.name.trim()
+        ? req.body.name.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48)
+        : `img_${Date.now()}`;
+
+    try {
+      const form = new URLSearchParams();
+      form.set('image', cleanBase64);
+      if (cleanName) form.set('name', cleanName);
+
+      const uploadRes = await fetch(
+        `https://api.imgbb.com/1/upload?key=${encodeURIComponent(imgbbKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: form.toString(),
+        }
+      );
+
+      const uploadJson = (await uploadRes.json().catch(() => ({}))) as {
+        success?: boolean;
+        data?: {
+          url?: string;
+          display_url?: string;
+          thumb?: { url?: string };
+        };
+        error?: { message?: string };
+      };
+
+      const imageUrl = uploadJson.data?.display_url || uploadJson.data?.url;
+      if (!uploadRes.ok || !uploadJson.success || !imageUrl) {
+        res.status(502).json({
+          ok: false,
+          error: uploadJson.error?.message || 'imgbb_upload_failed',
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        url: imageUrl,
+        thumbUrl: uploadJson.data?.thumb?.url || imageUrl,
+      });
+    } catch {
+      res.status(502).json({ ok: false, error: 'upload_unavailable' });
     }
   });
 

@@ -76,6 +76,7 @@ export interface DirectMessage {
   toUserId: string;
   senderName: string;
   text: string;
+  imageUrl?: string;
   createdAt: number;
   deliveredAt?: number;
   seenAt?: number;

@@ -499,6 +499,10 @@ export function subscribeToFirebaseChats(
                   toUserId: m.toUserId || '',
                   senderName: m.senderName || 'User',
                   text: m.text || '',
+                  imageUrl:
+                    typeof m.imageUrl === 'string' && m.imageUrl
+                      ? m.imageUrl
+                      : undefined,
                   createdAt:
                     typeof m.createdAt === 'number' ? m.createdAt : Date.now(),
                   unsent: Boolean(m.unsent),
@@ -928,12 +932,58 @@ export async function sendFirebaseTypingStatus(
   }
 }
 
+export async function uploadCompressedChatImage(
+  imageBase64: string,
+  name?: string
+): Promise<string> {
+  const idToken = await auth?.currentUser?.getIdToken();
+  const res = await fetch('/api/upload-image', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+    },
+    body: JSON.stringify({ imageBase64, name }),
+  });
+
+  const data = (await res.json().catch(() => ({}))) as {
+    ok?: boolean;
+    url?: string;
+    error?: string;
+  };
+  if (!res.ok || !data.ok || !data.url) {
+    throw new Error(data.error || 'Image upload failed');
+  }
+  return data.url;
+}
+
+export async function warmupPushEndpoint(peerUid?: string): Promise<void> {
+  try {
+    const idToken = await auth?.currentUser?.getIdToken();
+    if (!idToken) return;
+    await fetch('/api/push/reminder', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`,
+      },
+      body: JSON.stringify({
+        warmup: true,
+        ...(peerUid ? { toUserId: peerUid } : {}),
+      }),
+    });
+  } catch {
+    // Non-blocking warmup
+  }
+}
+
 export async function sendFirebaseDirectMessage(params: {
   myUid: string;
   myName: string;
   peerUid: string;
   text: string;
   messageId: string;
+  imageUrl?: string;
   replyTo?: ChatReplyPreview;
   chatAlreadyExists: boolean;
 }): Promise<void> {
@@ -944,66 +994,14 @@ export async function sendFirebaseDirectMessage(params: {
     peerUid,
     text,
     messageId,
+    imageUrl,
     replyTo,
     chatAlreadyExists,
   } = params;
   const chatId = makeDmId(myUid, peerUid);
   const now = Date.now();
   const chatRef = doc(db, 'chats', chatId);
-
-  if (chatAlreadyExists) {
-    try {
-      await updateDoc(chatRef, {
-        updatedAt: now,
-        lastMessage: {
-          text,
-          senderId: myUid,
-          createdAt: now,
-        },
-      });
-    } catch {
-      // Fallback to create if doc wasn't created remotely yet
-      await setDoc(
-        chatRef,
-        {
-          participants: [myUid, peerUid].sort(),
-          updatedAt: now,
-          lastMessage: {
-            text,
-            senderId: myUid,
-            createdAt: now,
-          },
-        },
-        { merge: true }
-      );
-    }
-  } else {
-    try {
-      await setDoc(
-        chatRef,
-        {
-          participants: [myUid, peerUid].sort(),
-          updatedAt: now,
-          lastMessage: {
-            text,
-            senderId: myUid,
-            createdAt: now,
-          },
-        },
-        { merge: true }
-      );
-    } catch {
-      // If chat already existed concurrently, update metadata only
-      await updateDoc(chatRef, {
-        updatedAt: now,
-        lastMessage: {
-          text,
-          senderId: myUid,
-          createdAt: now,
-        },
-      });
-    }
-  }
+  const lastPreviewText = text.trim() || (imageUrl ? '📷 Photo' : '');
 
   const msgPayload: Record<string, unknown> = {
     id: messageId,
@@ -1016,27 +1014,17 @@ export async function sendFirebaseDirectMessage(params: {
     createdAt: now,
     reactions: [],
   };
+  if (imageUrl) {
+    msgPayload.imageUrl = imageUrl;
+  }
   if (replyTo) {
     msgPayload.replyTo = replyTo;
   }
 
-  try {
-    await setDoc(
-      doc(db, 'chats', chatId, 'messages', messageId),
-      msgPayload
-    );
-  } catch (error) {
-    handleFirestoreError(
-      error,
-      OperationType.CREATE,
-      `chats/${chatId}/messages/${messageId}`
-    );
-  }
-
-  // Trigger background disguised reminder push via backend if available
-  try {
-    const idToken = await auth?.currentUser?.getIdToken();
-    if (idToken) {
+  const dispatchPushReminder = async () => {
+    try {
+      const idToken = await auth?.currentUser?.getIdToken();
+      if (!idToken) return;
       await fetch('/api/push/reminder', {
         method: 'POST',
         keepalive: true,
@@ -1044,12 +1032,90 @@ export async function sendFirebaseDirectMessage(params: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${idToken}`,
         },
-        body: JSON.stringify({ toUserId: peerUid }),
+        body: JSON.stringify({ toUserId: peerUid, messageId }),
       });
+    } catch {
+      // Non-blocking: foreground/realtime listeners still deliver messages
     }
-  } catch {
-    // Non-blocking: foreground/realtime listeners still deliver messages
+  };
+
+  if (chatAlreadyExists) {
+    // Fire chat update, message write, AND background push concurrently for sub-second delivery
+    const chatWrite = updateDoc(chatRef, {
+      updatedAt: now,
+      lastMessage: {
+        text: lastPreviewText,
+        senderId: myUid,
+        createdAt: now,
+      },
+    }).catch(() =>
+      setDoc(
+        chatRef,
+        {
+          participants: [myUid, peerUid].sort(),
+          updatedAt: now,
+          lastMessage: {
+            text: lastPreviewText,
+            senderId: myUid,
+            createdAt: now,
+          },
+        },
+        { merge: true }
+      )
+    );
+
+    const msgWrite = setDoc(
+      doc(db, 'chats', chatId, 'messages', messageId),
+      msgPayload
+    ).catch((error) => {
+      handleFirestoreError(
+        error,
+        OperationType.CREATE,
+        `chats/${chatId}/messages/${messageId}`
+      );
+    });
+
+    await Promise.all([chatWrite, msgWrite, dispatchPushReminder()]);
+    return;
   }
+
+  try {
+    await setDoc(
+      chatRef,
+      {
+        participants: [myUid, peerUid].sort(),
+        updatedAt: now,
+        lastMessage: {
+          text: lastPreviewText,
+          senderId: myUid,
+          createdAt: now,
+        },
+      },
+      { merge: true }
+    );
+  } catch {
+    await updateDoc(chatRef, {
+      updatedAt: now,
+      lastMessage: {
+        text: lastPreviewText,
+        senderId: myUid,
+        createdAt: now,
+      },
+    });
+  }
+
+  const msgWrite = setDoc(
+    doc(db, 'chats', chatId, 'messages', messageId),
+    msgPayload
+  ).catch((error) => {
+    handleFirestoreError(
+      error,
+      OperationType.CREATE,
+      `chats/${chatId}/messages/${messageId}`
+    );
+  });
+
+  await Promise.all([msgWrite, dispatchPushReminder()]);
 }
 
 export async function toggleFirebaseMessageReaction(
@@ -1099,6 +1165,7 @@ export async function deleteFirebaseDirectMessage(
   try {
     await updateDoc(doc(db, 'chats', chatId, 'messages', messageId), {
       text: '',
+      imageUrl: deleteField(),
       unsent: true,
       unsentAt: Date.now(),
       replyTo: deleteField(),
@@ -1247,20 +1314,104 @@ export async function registerFirebasePushNotifications(
   }
 }
 
+export function syncMutePrefToSw(muted: boolean): void {
+  if (typeof caches !== 'undefined') {
+    void caches
+      .open('notepad-prefs-v1')
+      .then((cache) =>
+        cache.put('/__mute_pref__', new Response(muted ? '1' : '0'))
+      )
+      .catch(() => {});
+  }
+  if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+    try {
+      navigator.serviceWorker.controller.postMessage({
+        type: 'SET_MUTE_PREF',
+        muted,
+      });
+    } catch {
+      // Ignore postMessage failure
+    }
+  }
+}
+
+export function syncActiveChatToSw(
+  peerId: string | null,
+  visible: boolean
+): void {
+  if (typeof caches !== 'undefined') {
+    void caches
+      .open('notepad-prefs-v1')
+      .then((cache) =>
+        cache.put(
+          '/__active_chat__',
+          new Response(JSON.stringify({ peerId, visible }))
+        )
+      )
+      .catch(() => {});
+  }
+  if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+    try {
+      navigator.serviceWorker.controller.postMessage({
+        type: 'SET_ACTIVE_CHAT',
+        peerId,
+        visible,
+      });
+    } catch {
+      // Ignore postMessage failure
+    }
+  }
+}
+
+export function markMessageNotifiedInSw(messageId: string): void {
+  if (!messageId) return;
+  if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+    try {
+      navigator.serviceWorker.controller.postMessage({
+        type: 'MARK_NOTIFIED',
+        messageId,
+      });
+    } catch {
+      // Ignore postMessage failure
+    }
+  }
+}
+
 export async function attachForegroundMessageListener(
-  onReminder: () => void
+  onReminder: (meta?: {
+    fromUserId?: string;
+    messageId?: string;
+    shownInSw?: boolean;
+  }) => void
 ): Promise<() => void> {
   let unsubFcm: (() => void) | null = null;
   const messaging = await getFirebaseMessagingSafe();
   if (messaging) {
-    unsubFcm = onMessage(messaging, () => {
-      onReminder();
+    unsubFcm = onMessage(messaging, (payload) => {
+      const fromUserId =
+        typeof payload?.data?.fromUserId === 'string'
+          ? payload.data.fromUserId
+          : undefined;
+      const messageId =
+        typeof payload?.data?.messageId === 'string'
+          ? payload.data.messageId
+          : undefined;
+      onReminder({ fromUserId, messageId, shownInSw: false });
     });
   }
 
   const handleSwMessage = (event: MessageEvent) => {
     if (event.data && event.data.type === 'NOTEPAD_PUSH_REMINDER') {
-      onReminder();
+      const fromUserId =
+        typeof event.data?.payload?.data?.fromUserId === 'string'
+          ? event.data.payload.data.fromUserId
+          : undefined;
+      const messageId =
+        typeof event.data?.payload?.data?.messageId === 'string'
+          ? event.data.payload.data.messageId
+          : undefined;
+      const shownInSw = Boolean(event.data?.shownInSw);
+      onReminder({ fromUserId, messageId, shownInSw });
     }
   };
   if ('serviceWorker' in navigator) {

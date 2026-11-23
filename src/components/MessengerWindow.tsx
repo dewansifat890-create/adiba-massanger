@@ -1,14 +1,19 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import {
   ArrowUp,
   Ban,
   Bell,
+  BellOff,
   BellRing,
+  Camera,
   Check,
   CheckCheck,
   ChevronLeft,
   Copy,
   EyeOff,
+  Image as ImageIcon,
+  Loader2,
   MessageCircle,
   Mic,
   Plus,
@@ -17,6 +22,8 @@ import {
   Search,
   User,
   UserPlus,
+  Volume2,
+  VolumeX,
   X,
 } from 'lucide-react';
 import {
@@ -26,6 +33,8 @@ import {
   FontStyle,
   MessengerUser,
 } from '../types/notes';
+import { uploadCompressedChatImage } from '../services/firebaseMessenger';
+import { compressImageToFewKb } from '../utils/imageCompressor';
 import { getAccentClasses, getFontClass } from '../utils/noteHelpers';
 import { PWAInstallButton } from './PWAInstallButton';
 
@@ -48,6 +57,7 @@ interface MessengerWindowProps {
     query?: string;
   };
   notificationsEnabled: boolean;
+  messagesMuted?: boolean;
   pushTokenReady?: boolean;
   accent: AccentColor;
   fontStyle: FontStyle;
@@ -66,12 +76,14 @@ interface MessengerWindowProps {
   onSendMessage: (
     toUserId: string,
     text: string,
-    replyTo?: ChatReplyPreview
+    replyTo?: ChatReplyPreview,
+    imageUrl?: string
   ) => void;
   onReactMessage: (dmId: string, messageId: string, emoji: string) => void;
   onDeleteMessage: (dmId: string, messageId: string) => void;
   onTyping: (toUserId: string, isTyping: boolean) => void;
   onToggleNotifications: () => void;
+  onToggleMute?: () => void;
   onTestReminder: () => void;
   onShowToast: (message: string) => void;
 }
@@ -150,6 +162,7 @@ export function MessengerWindow({
   isAnonymousUser = true,
   lookupResult,
   notificationsEnabled,
+  messagesMuted = false,
   pushTokenReady = false,
   accent,
   fontStyle,
@@ -169,6 +182,7 @@ export function MessengerWindow({
   onDeleteMessage,
   onTyping,
   onToggleNotifications,
+  onToggleMute,
   onTestReminder,
   onShowToast,
 }: MessengerWindowProps) {
@@ -189,6 +203,9 @@ export function MessengerWindow({
   const [replyTo, setReplyTo] = useState<ChatReplyPreview | null>(null);
   const [selectedMsgId, setSelectedMsgId] = useState<string | null>(null);
   const [listening, setListening] = useState(false);
+  const [showAttachMenu, setShowAttachMenu] = useState(false);
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const [lightboxImageUrl, setLightboxImageUrl] = useState<string | null>(null);
   const [nowTick, setNowTick] = useState<number>(() => Date.now());
 
   const [vpBounds, setVpBounds] = useState<{ height: number; offsetTop: number } | null>(null);
@@ -197,6 +214,8 @@ export function MessengerWindow({
   const bottomRef = useRef<HTMLDivElement>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const photoInputRef = useRef<HTMLInputElement>(null);
+  const cameraInputRef = useRef<HTMLInputElement>(null);
   const typingTimeoutRef = useRef<number | null>(null);
   const lastTypingPingRef = useRef<number>(0);
   const isTypingSentRef = useRef(false);
@@ -257,6 +276,9 @@ export function MessengerWindow({
     [activeDmId, conversations]
   );
 
+  const prevOpenedPeerRef = useRef<string | null>(null);
+  const prevMsgCountRef = useRef<number>(0);
+
   const scrollMessagesToBottom = (smooth = false) => {
     const container = messagesScrollRef.current;
     if (!container) return;
@@ -267,11 +289,45 @@ export function MessengerWindow({
     }
   };
 
-  useEffect(() => {
-    if (selectedPeerId) {
-      scrollMessagesToBottom(true);
+  // Start directly at the latest message when entering a chat box (no top-to-bottom scroll)
+  useLayoutEffect(() => {
+    if (!selectedPeerId) {
+      prevOpenedPeerRef.current = null;
+      prevMsgCountRef.current = 0;
+      return;
     }
-  }, [activeMessages.length, selectedPeerId, typingFromUsers]);
+    if (prevOpenedPeerRef.current !== selectedPeerId) {
+      prevOpenedPeerRef.current = selectedPeerId;
+      prevMsgCountRef.current = activeMessages.length;
+      scrollMessagesToBottom(false);
+    }
+  }, [selectedPeerId, activeMessages.length]);
+
+  // Smooth-scroll only when new messages arrive inside an already-open chat
+  useEffect(() => {
+    if (!selectedPeerId || prevOpenedPeerRef.current !== selectedPeerId) return;
+    const prevCount = prevMsgCountRef.current;
+    const nextCount = activeMessages.length;
+    if (nextCount > prevCount) {
+      prevMsgCountRef.current = nextCount;
+      const shouldSmooth = prevCount > 0 && nextCount - prevCount <= 2;
+      scrollMessagesToBottom(shouldSmooth);
+    } else {
+      prevMsgCountRef.current = nextCount;
+    }
+  }, [activeMessages.length, selectedPeerId]);
+
+  // Keep typing indicator visible only if already near the bottom
+  useEffect(() => {
+    if (!selectedPeerId) return;
+    const container = messagesScrollRef.current;
+    if (!container) return;
+    const isNearBottom =
+      container.scrollHeight - container.scrollTop - container.clientHeight < 90;
+    if (isNearBottom) {
+      scrollMessagesToBottom(false);
+    }
+  }, [selectedPeerId, typingFromUsers]);
 
   // Keep mobile chat header & messages steady while moving only the input bar with the soft keyboard
   useEffect(() => {
@@ -394,6 +450,7 @@ export function MessengerWindow({
   const handleOpenPeerChat = (peer: MessengerUser) => {
     setSelectedPeerId(peer.userId);
     setSelectedMsgId(null);
+    setShowAttachMenu(false);
     setReplyTo(null);
     onOpenChat(peer.userId);
   };
@@ -407,6 +464,7 @@ export function MessengerWindow({
     }
     setSelectedPeerId(null);
     setSelectedMsgId(null);
+    setShowAttachMenu(false);
     setReplyTo(null);
     onCloseChat();
   };
@@ -439,11 +497,50 @@ export function MessengerWindow({
     onSendMessage(selectedPeer.userId, draft.trim(), replyTo ?? undefined);
     setDraft('');
     setReplyTo(null);
+    setShowAttachMenu(false);
     if (typingTimeoutRef.current) window.clearTimeout(typingTimeoutRef.current);
     isTypingSentRef.current = false;
     lastTypingPingRef.current = 0;
     onTyping(selectedPeer.userId, false);
     requestAnimationFrame(() => inputRef.current?.focus());
+  };
+
+  const handleImageFileSelected = async (file?: File | null) => {
+    if (!file || !selectedPeer || uploadingImage) return;
+    setShowAttachMenu(false);
+
+    if (file.type && !file.type.startsWith('image/')) {
+      onShowToast('Please choose an image file');
+      return;
+    }
+
+    setUploadingImage(true);
+    try {
+      const compressed = await compressImageToFewKb(file);
+      const imageUrl = await uploadCompressedChatImage(
+        compressed.base64,
+        `chat_${Date.now()}`
+      );
+      const caption = draft.trim();
+      onSendMessage(
+        selectedPeer.userId,
+        caption,
+        replyTo ?? undefined,
+        imageUrl
+      );
+      if (caption) setDraft('');
+      setReplyTo(null);
+      requestAnimationFrame(() => scrollMessagesToBottom(true));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '';
+      if (msg === 'missing_imgbb_api_key') {
+        onShowToast('Set IMGBB_API_KEY in server environment variables');
+      } else {
+        onShowToast('Could not upload image');
+      }
+    } finally {
+      setUploadingImage(false);
+    }
   };
 
   const handleVoiceDictate = () => {
@@ -712,7 +809,9 @@ export function MessengerWindow({
                           </div>
                         ) : (
                           <div
-                            className={`max-w-[80%] sm:max-w-[68%] px-3.5 py-2.5 rounded-2xl transition-transform duration-150 ${
+                            className={`max-w-[80%] sm:max-w-[68%] ${
+                              msg.imageUrl && !msg.text ? 'p-1.5' : 'px-3.5 py-2.5'
+                            } rounded-2xl transition-transform duration-150 ${
                               isSelected ? 'scale-[0.98]' : ''
                             } ${
                               isMine
@@ -733,14 +832,39 @@ export function MessengerWindow({
                               </div>
                             )}
 
-                            <p
-                              className={`${fontClass} text-[15px] leading-relaxed whitespace-pre-wrap break-words`}
-                            >
-                              {msg.text}
-                            </p>
+                            {msg.imageUrl && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setLightboxImageUrl(msg.imageUrl!);
+                                }}
+                                aria-label="View full photo"
+                                className={`block w-full overflow-hidden rounded-xl bg-black/10 ${
+                                  msg.text ? 'mb-2' : ''
+                                }`}
+                              >
+                                <img
+                                  src={msg.imageUrl}
+                                  alt="Shared attachment"
+                                  loading="lazy"
+                                  className="w-full max-w-[250px] max-h-[310px] object-cover rounded-xl block"
+                                />
+                              </button>
+                            )}
+
+                            {msg.text ? (
+                              <p
+                                className={`${fontClass} text-[15px] leading-relaxed whitespace-pre-wrap break-words`}
+                              >
+                                {msg.text}
+                              </p>
+                            ) : null}
 
                             <div
-                              className={`mt-1 flex items-center justify-end gap-1 text-[10px] tabular-nums ${
+                              className={`${
+                                msg.imageUrl && !msg.text ? 'px-1.5 pb-0.5 pt-1' : 'mt-1'
+                              } flex items-center justify-end gap-1 text-[10px] tabular-nums ${
                                 isMine ? 'text-blue-100' : 'text-slate-400 dark:text-zinc-500'
                               }`}
                             >
@@ -832,7 +956,91 @@ export function MessengerWindow({
           } bg-[#f2f2f7]/95 dark:bg-black/95 border-t border-slate-200/60 dark:border-white/[0.06]`}
           onClick={(e) => e.stopPropagation()}
         >
-          <div className={`mx-auto ${isMobileFrame ? 'w-full' : 'max-w-3xl'}`}>
+          <div className={`relative mx-auto ${isMobileFrame ? 'w-full' : 'max-w-3xl'}`}>
+            {/* Hidden Gallery & Camera File Inputs */}
+            <input
+              ref={photoInputRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                e.target.value = '';
+                void handleImageFileSelected(file);
+              }}
+            />
+            <input
+              ref={cameraInputRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                e.target.value = '';
+                void handleImageFileSelected(file);
+              }}
+            />
+
+            {/* Frosted Glass Animated Attachment Menu (+ button) */}
+            <AnimatePresence>
+              {showAttachMenu && (
+                <>
+                  <div
+                    className="fixed inset-0 z-30"
+                    onClick={() => setShowAttachMenu(false)}
+                    aria-hidden="true"
+                  />
+                  <motion.div
+                    initial={{ opacity: 0, y: 12, scale: 0.92 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 10, scale: 0.94 }}
+                    transition={{ type: 'spring', stiffness: 420, damping: 28 }}
+                    className="absolute bottom-14 left-0 z-40 w-48 rounded-2xl p-1.5 backdrop-blur-2xl bg-white/80 dark:bg-zinc-900/80 border border-white/60 dark:border-white/15 shadow-2xl divide-y divide-slate-900/10 dark:divide-white/10"
+                    role="menu"
+                    aria-label="Attachment options"
+                  >
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setShowAttachMenu(false);
+                        photoInputRef.current?.click();
+                      }}
+                      className="w-full px-3 py-2.5 rounded-xl flex items-center gap-3 text-sm font-medium text-slate-900 dark:text-white hover:bg-black/5 dark:hover:bg-white/10 active:scale-[0.98] transition-all"
+                    >
+                      <span className="w-8 h-8 rounded-full bg-blue-500/15 text-blue-600 dark:text-blue-400 flex items-center justify-center shrink-0">
+                        <ImageIcon className="w-4 h-4" />
+                      </span>
+                      <span>Photo</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setShowAttachMenu(false);
+                        cameraInputRef.current?.click();
+                      }}
+                      className="w-full px-3 py-2.5 rounded-xl flex items-center gap-3 text-sm font-medium text-slate-900 dark:text-white hover:bg-black/5 dark:hover:bg-white/10 active:scale-[0.98] transition-all"
+                    >
+                      <span className="w-8 h-8 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 flex items-center justify-center shrink-0">
+                        <Camera className="w-4 h-4" />
+                      </span>
+                      <span>Camera</span>
+                    </button>
+                  </motion.div>
+                </>
+              )}
+            </AnimatePresence>
+
+            {uploadingImage && (
+              <div className="mb-2 px-3.5 py-2 rounded-2xl backdrop-blur-xl bg-white/85 dark:bg-[#1C1C1E]/90 border border-slate-200 dark:border-white/[0.1] flex items-center gap-2.5 text-xs font-medium text-slate-700 dark:text-zinc-200 shadow-sm">
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-500 shrink-0" />
+                <span>Compressing &amp; sending photo…</span>
+              </div>
+            )}
+
             {replyTo && (
               <div className="mb-2 px-3.5 py-2 rounded-2xl bg-white dark:bg-[#1C1C1E] border border-slate-200 dark:border-white/[0.1] flex items-center justify-between gap-2">
                 <div className="min-w-0">
@@ -857,16 +1065,15 @@ export function MessengerWindow({
             <div className="h-12 rounded-full bg-white dark:bg-[#1C1C1E] border border-slate-200/90 dark:border-white/[0.1] shadow-lg flex items-center pl-2 pr-1.5 gap-1.5">
               <button
                 type="button"
-                onClick={() => {
-                  const timeStr = new Intl.DateTimeFormat('en-US', {
-                    hour: 'numeric',
-                    minute: '2-digit',
-                  }).format(new Date());
-                  setDraft((prev) => (prev ? `${prev} [${timeStr}]` : `[${timeStr}] `));
-                  inputRef.current?.focus();
-                }}
-                aria-label="Insert time"
-                className="w-9 h-9 rounded-full flex items-center justify-center text-slate-500 dark:text-zinc-400 hover:bg-slate-100 dark:hover:bg-white/[0.06] shrink-0"
+                disabled={uploadingImage}
+                onClick={() => setShowAttachMenu((v) => !v)}
+                aria-label="Attach photo or camera"
+                aria-expanded={showAttachMenu}
+                className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 transition-all duration-200 disabled:opacity-50 ${
+                  showAttachMenu
+                    ? 'bg-blue-600 text-white rotate-45'
+                    : 'text-slate-500 dark:text-zinc-400 hover:bg-slate-100 dark:hover:bg-white/[0.06]'
+                }`}
               >
                 <Plus className="w-[18px] h-[18px]" />
               </button>
@@ -877,6 +1084,7 @@ export function MessengerWindow({
                 value={draft}
                 onChange={(e) => handleDraftChange(e.target.value)}
                 onFocus={() => {
+                  setShowAttachMenu(false);
                   if (!isMobileFrame) {
                     const pinTop = () => {
                       if (window.scrollY !== 0 || window.scrollX !== 0) {
@@ -975,9 +1183,20 @@ export function MessengerWindow({
                       : 'bg-white/85 dark:bg-zinc-900/85 border-white/50 dark:border-white/15 text-slate-900 dark:text-white mr-auto max-w-[85%]'
                   }`}
                 >
-                  <p className="text-[14px] leading-relaxed whitespace-pre-wrap break-words max-h-32 overflow-y-auto no-scrollbar">
-                    {selectedMsg.text}
-                  </p>
+                  {selectedMsg.imageUrl && (
+                    <img
+                      src={selectedMsg.imageUrl}
+                      alt="Selected attachment"
+                      className={`max-h-36 rounded-xl object-cover ${
+                        selectedMsg.text ? 'mb-2' : ''
+                      }`}
+                    />
+                  )}
+                  {selectedMsg.text && (
+                    <p className="text-[14px] leading-relaxed whitespace-pre-wrap break-words max-h-32 overflow-y-auto no-scrollbar">
+                      {selectedMsg.text}
+                    </p>
+                  )}
                 </div>
 
                 {/* Frosted Glass Reactions Pill */}
@@ -1005,7 +1224,9 @@ export function MessengerWindow({
                       setReplyTo({
                         id: selectedMsg.id,
                         senderName: selectedMsg.senderName,
-                        text: selectedMsg.text,
+                        text:
+                          selectedMsg.text ||
+                          (selectedMsg.imageUrl ? '📷 Photo' : ''),
                       });
                       setSelectedMsgId(null);
                       inputRef.current?.focus();
@@ -1016,22 +1237,26 @@ export function MessengerWindow({
                     <Reply className="w-4 h-4 opacity-75" />
                   </button>
 
-                  <button
-                    type="button"
-                    onClick={() => {
-                      try {
-                        navigator.clipboard.writeText(selectedMsg.text);
-                        onShowToast('Copied');
-                      } catch {
-                        // Ignore
-                      }
-                      setSelectedMsgId(null);
-                    }}
-                    className="w-full px-4 py-3 flex items-center justify-between text-sm font-medium text-slate-900 dark:text-white hover:bg-black/5 dark:hover:bg-white/5"
-                  >
-                    <span>Copy</span>
-                    <Copy className="w-4 h-4 opacity-75" />
-                  </button>
+                  {(selectedMsg.text || selectedMsg.imageUrl) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        try {
+                          navigator.clipboard.writeText(
+                            selectedMsg.text || selectedMsg.imageUrl || ''
+                          );
+                          onShowToast('Copied');
+                        } catch {
+                          // Ignore
+                        }
+                        setSelectedMsgId(null);
+                      }}
+                      className="w-full px-4 py-3 flex items-center justify-between text-sm font-medium text-slate-900 dark:text-white hover:bg-black/5 dark:hover:bg-white/5"
+                    >
+                      <span>{selectedMsg.text ? 'Copy' : 'Copy Photo Link'}</span>
+                      <Copy className="w-4 h-4 opacity-75" />
+                    </button>
+                  )}
 
                   {selectedIsMine && (
                     <button
@@ -1051,6 +1276,34 @@ export function MessengerWindow({
             </div>
           );
         })()}
+
+        {/* Fullscreen Image Lightbox */}
+        {lightboxImageUrl && (
+          <div
+            className={`${
+              isMobileFrame ? 'absolute' : 'fixed'
+            } inset-0 z-50 bg-black/90 backdrop-blur-md flex flex-col items-center justify-center p-4`}
+            onClick={() => setLightboxImageUrl(null)}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Photo preview"
+          >
+            <button
+              type="button"
+              onClick={() => setLightboxImageUrl(null)}
+              aria-label="Close photo"
+              className="absolute top-4 right-4 h-11 w-11 rounded-full bg-white/15 text-white flex items-center justify-center"
+            >
+              <X className="w-5 h-5" />
+            </button>
+            <img
+              src={lightboxImageUrl}
+              alt="Full size preview"
+              onClick={(e) => e.stopPropagation()}
+              className="max-w-full max-h-[82vh] rounded-2xl object-contain shadow-2xl"
+            />
+          </div>
+        )}
       </div>
     );
   }
@@ -1106,14 +1359,18 @@ export function MessengerWindow({
           <button
             type="button"
             onClick={() => setShowNotifModal(true)}
-            aria-label="Notification settings"
+            aria-label="Notification & mute settings"
             className={`h-11 w-11 rounded-full bg-white dark:bg-[#1C1C1E] border border-slate-200/80 dark:border-white/[0.1] flex items-center justify-center shadow-xs ${
-              notificationsEnabled
+              messagesMuted
+                ? 'text-amber-500'
+                : notificationsEnabled
                 ? 'text-blue-500'
                 : 'text-slate-700 dark:text-zinc-200'
             }`}
           >
-            {notificationsEnabled ? (
+            {messagesMuted ? (
+              <BellOff className="w-[18px] h-[18px]" />
+            ) : notificationsEnabled ? (
               <BellRing className="w-[18px] h-[18px]" />
             ) : (
               <Bell className="w-[18px] h-[18px]" />
@@ -1294,7 +1551,9 @@ export function MessengerWindow({
                               ? lastMsg.fromUserId === currentUser.userId
                                 ? 'You unsent a message'
                                 : 'This message was deleted'
-                              : `${lastMsg.fromUserId === currentUser.userId ? 'You: ' : ''}${lastMsg.text}`
+                              : `${lastMsg.fromUserId === currentUser.userId ? 'You: ' : ''}${
+                                  lastMsg.text || (lastMsg.imageUrl ? '📷 Photo' : '')
+                                }`
                             : isOnline
                             ? `Online · @${peer.handle}`
                             : `${formatLastSeen(lastSeenTs, nowTick)} · @${peer.handle}`}
@@ -1638,6 +1897,53 @@ export function MessengerWindow({
             <p className="text-xs text-slate-500 dark:text-zinc-400">
               Incoming messages trigger a discreet alert with no sender name or chat text shown. Install NotePad to your Home Screen for background alerts.
             </p>
+
+            {/* Mute Message Sound Toggle */}
+            <div className="p-3.5 rounded-2xl bg-slate-100 dark:bg-black/60 border border-slate-200 dark:border-white/[0.08] flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <div
+                  className={`w-9 h-9 rounded-xl flex items-center justify-center shrink-0 ${
+                    messagesMuted
+                      ? 'bg-amber-500/15 text-amber-500'
+                      : 'bg-blue-500/15 text-blue-500'
+                  }`}
+                >
+                  {messagesMuted ? (
+                    <VolumeX className="w-4 h-4" />
+                  ) : (
+                    <Volume2 className="w-4 h-4" />
+                  )}
+                </div>
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-slate-900 dark:text-white">
+                    Mute Messages
+                  </div>
+                  <div className="text-[11px] text-slate-500 dark:text-zinc-400 truncate">
+                    {messagesMuted
+                      ? 'Silent mode on (no sound)'
+                      : 'Sound on for new messages'}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={messagesMuted}
+                aria-label="Mute message sounds"
+                onClick={onToggleMute}
+                className={`relative inline-flex h-7 w-12 shrink-0 items-center rounded-full transition-colors ${
+                  messagesMuted
+                    ? 'bg-amber-500'
+                    : 'bg-slate-300 dark:bg-zinc-700'
+                }`}
+              >
+                <span
+                  className={`inline-block h-5 w-5 transform rounded-full bg-white shadow-xs transition-transform ${
+                    messagesMuted ? 'translate-x-6' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
 
             <div className="space-y-2">
               <button
