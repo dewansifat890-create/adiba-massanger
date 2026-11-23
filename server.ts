@@ -4,6 +4,7 @@ import { getApp, getApps, initializeApp } from 'firebase-admin/app';
 import { getAuth as getAdminAuth } from 'firebase-admin/auth';
 import { getFirestore as getAdminFirestore } from 'firebase-admin/firestore';
 import { getMessaging as getAdminMessaging } from 'firebase-admin/messaging';
+import { createHash } from 'node:crypto';
 import fs from 'fs';
 import http from 'http';
 import os from 'os';
@@ -37,6 +38,8 @@ interface DirectMessage {
   senderName: string;
   text: string;
   imageUrl?: string;
+  voiceUrl?: string;
+  voiceDuration?: number;
   createdAt: number;
   deliveredAt?: number;
   seenAt?: number;
@@ -124,7 +127,7 @@ async function startServer() {
     }
   });
 
-  app.use(express.json({ limit: '2mb' }));
+  app.use(express.json({ limit: '6mb' }));
 
   const firebaseProjectId =
     process.env.VITE_FIREBASE_PROJECT_ID || 'adiba-massanger';
@@ -409,9 +412,31 @@ self.addEventListener('notificationclick', function (event) {
     }
   });
 
+  const getCloudinaryCreds = () => {
+    const rawUrl = process.env.CLOUDINARY_URL?.trim();
+    if (rawUrl) {
+      const match = rawUrl.match(/^cloudinary:\/\/([^:]+):([^@]+)@([^/\s]+)$/i);
+      if (match) {
+        return {
+          apiKey: decodeURIComponent(match[1]),
+          apiSecret: decodeURIComponent(match[2]),
+          cloudName: decodeURIComponent(match[3]),
+        };
+      }
+    }
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME?.trim() || '';
+    const apiKey = process.env.CLOUDINARY_API_KEY?.trim() || '';
+    const apiSecret = process.env.CLOUDINARY_API_SECRET?.trim() || '';
+    if (cloudName && apiKey && apiSecret) {
+      return { cloudName, apiKey, apiSecret };
+    }
+    return null;
+  };
+
   app.post('/api/upload-image', async (req, res) => {
-    const imgbbKey = process.env.IMGBB_API_KEY?.trim();
-    if (!imgbbKey) {
+    const imgbbKey = process.env.IMGBB_API_KEY?.trim() || '';
+    const cloudinaryCreds = getCloudinaryCreds();
+    if (!imgbbKey && !cloudinaryCreds) {
       res.status(503).json({ ok: false, error: 'missing_imgbb_api_key' });
       return;
     }
@@ -437,6 +462,8 @@ self.addEventListener('notificationclick', function (event) {
       typeof req.body?.imageBase64 === 'string'
         ? req.body.imageBase64.trim()
         : '';
+    const mimeMatch = rawBase64.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,/);
+    const mimeType = mimeMatch ? mimeMatch[1] : 'image/jpeg';
     const cleanBase64 = rawBase64.replace(
       /^data:image\/[a-zA-Z0-9+.-]+;base64,/,
       ''
@@ -452,47 +479,197 @@ self.addEventListener('notificationclick', function (event) {
       typeof req.body?.name === 'string' && req.body.name.trim()
         ? req.body.name.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48)
         : `img_${Date.now()}`;
+    const binary = Buffer.from(cleanBase64, 'base64');
+    let lastError = 'upload_unavailable';
+
+    if (imgbbKey) {
+      try {
+        const form = new FormData();
+        form.append('key', imgbbKey);
+        form.append(
+          'image',
+          new Blob([binary], { type: mimeType }),
+          `${cleanName}.jpg`
+        );
+        form.append('name', cleanName);
+
+        const uploadRes = await fetch('https://api.imgbb.com/1/upload', {
+          method: 'POST',
+          body: form,
+        });
+        const uploadJson = (await uploadRes.json().catch(() => ({}))) as {
+          success?: boolean;
+          data?: {
+            url?: string;
+            display_url?: string;
+            thumb?: { url?: string };
+          };
+          error?: { message?: string };
+        };
+        const imageUrl = uploadJson.data?.display_url || uploadJson.data?.url;
+        if (uploadRes.ok && uploadJson.success && imageUrl) {
+          res.json({
+            ok: true,
+            url: imageUrl,
+            thumbUrl: uploadJson.data?.thumb?.url || imageUrl,
+          });
+          return;
+        }
+        lastError = uploadJson.error?.message || `imgbb_http_${uploadRes.status}`;
+      } catch (err: unknown) {
+        lastError = err instanceof Error ? err.message : 'imgbb_network_error';
+      }
+    }
+
+    if (cloudinaryCreds) {
+      try {
+        const timestamp = Math.floor(Date.now() / 1000);
+        const folder = 'notepad_images';
+        const toSign = `folder=${folder}&timestamp=${timestamp}${cloudinaryCreds.apiSecret}`;
+        const signature = createHash('sha1').update(toSign).digest('hex');
+
+        const form = new FormData();
+        form.append(
+          'file',
+          new Blob([binary], { type: mimeType }),
+          `${cleanName}.jpg`
+        );
+        form.append('api_key', cloudinaryCreds.apiKey);
+        form.append('timestamp', String(timestamp));
+        form.append('folder', folder);
+        form.append('signature', signature);
+
+        const uploadRes = await fetch(
+          `https://api.cloudinary.com/v1_1/${encodeURIComponent(
+            cloudinaryCreds.cloudName
+          )}/image/upload`,
+          { method: 'POST', body: form }
+        );
+        const uploadJson = (await uploadRes.json().catch(() => ({}))) as {
+          secure_url?: string;
+          error?: { message?: string };
+        };
+        if (uploadRes.ok && uploadJson.secure_url) {
+          res.json({
+            ok: true,
+            url: uploadJson.secure_url,
+            thumbUrl: uploadJson.secure_url,
+          });
+          return;
+        }
+        lastError =
+          uploadJson.error?.message || `cloudinary_http_${uploadRes.status}`;
+      } catch (err: unknown) {
+        lastError = err instanceof Error ? err.message : 'cloudinary_network_error';
+      }
+    }
+
+    res.status(502).json({ ok: false, error: lastError });
+  });
+
+  app.post('/api/upload-voice', async (req, res) => {
+    const creds = getCloudinaryCreds();
+    if (!creds) {
+      res.status(503).json({ ok: false, error: 'missing_cloudinary_config' });
+      return;
+    }
+
+    if (adminApp) {
+      const authHeader = req.headers.authorization || '';
+      const token = authHeader.startsWith('Bearer ')
+        ? authHeader.slice('Bearer '.length).trim()
+        : '';
+      if (!token) {
+        res.status(401).json({ ok: false, error: 'Missing bearer token' });
+        return;
+      }
+      try {
+        await getAdminAuth(adminApp).verifyIdToken(token);
+      } catch {
+        res.status(401).json({ ok: false, error: 'Invalid auth token' });
+        return;
+      }
+    }
+
+    const rawBase64 =
+      typeof req.body?.audioBase64 === 'string'
+        ? req.body.audioBase64.trim()
+        : '';
+    const dataPrefixMatch = rawBase64.match(
+      /^data:(audio\/[a-zA-Z0-9+.-]+|video\/[a-zA-Z0-9+.-]+)(?:;[^,]*)?;base64,/
+    );
+    const bodyMime =
+      typeof req.body?.mimeType === 'string' && req.body.mimeType.trim()
+        ? req.body.mimeType.split(';')[0].trim()
+        : '';
+    const mimeType = bodyMime || dataPrefixMatch?.[1] || 'audio/webm';
+    const cleanBase64 = rawBase64.replace(
+      /^data:(?:audio|video)\/[a-zA-Z0-9+.-]+(?:;[^,]*)?;base64,/,
+      ''
+    );
+
+    if (!cleanBase64 || cleanBase64.length > 5_000_000) {
+      res
+        .status(400)
+        .json({ ok: false, error: 'Invalid or oversized audio payload' });
+      return;
+    }
+
+    const cleanName =
+      typeof req.body?.name === 'string' && req.body.name.trim()
+        ? req.body.name.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48)
+        : `voice_${Date.now()}`;
+    const ext = mimeType.includes('mp4')
+      ? 'm4a'
+      : mimeType.includes('ogg')
+      ? 'ogg'
+      : mimeType.includes('mpeg') || mimeType.includes('mp3')
+      ? 'mp3'
+      : 'webm';
 
     try {
-      const form = new URLSearchParams();
-      form.set('image', cleanBase64);
-      if (cleanName) form.set('name', cleanName);
+      const timestamp = Math.floor(Date.now() / 1000);
+      const folder = 'notepad_voice';
+      const toSign = `folder=${folder}&timestamp=${timestamp}${creds.apiSecret}`;
+      const signature = createHash('sha1').update(toSign).digest('hex');
+
+      const binary = Buffer.from(cleanBase64, 'base64');
+      const form = new FormData();
+      form.append(
+        'file',
+        new Blob([binary], { type: mimeType }),
+        `${cleanName}.${ext}`
+      );
+      form.append('api_key', creds.apiKey);
+      form.append('timestamp', String(timestamp));
+      form.append('folder', folder);
+      form.append('signature', signature);
 
       const uploadRes = await fetch(
-        `https://api.imgbb.com/1/upload?key=${encodeURIComponent(imgbbKey)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: form.toString(),
-        }
+        `https://api.cloudinary.com/v1_1/${encodeURIComponent(
+          creds.cloudName
+        )}/video/upload`,
+        { method: 'POST', body: form }
       );
-
       const uploadJson = (await uploadRes.json().catch(() => ({}))) as {
-        success?: boolean;
-        data?: {
-          url?: string;
-          display_url?: string;
-          thumb?: { url?: string };
-        };
+        secure_url?: string;
         error?: { message?: string };
       };
-
-      const imageUrl = uploadJson.data?.display_url || uploadJson.data?.url;
-      if (!uploadRes.ok || !uploadJson.success || !imageUrl) {
+      if (!uploadRes.ok || !uploadJson.secure_url) {
         res.status(502).json({
           ok: false,
-          error: uploadJson.error?.message || 'imgbb_upload_failed',
+          error: uploadJson.error?.message || `cloudinary_http_${uploadRes.status}`,
         });
         return;
       }
 
-      res.json({
-        ok: true,
-        url: imageUrl,
-        thumbUrl: uploadJson.data?.thumb?.url || imageUrl,
-      });
+      const playableUrl = uploadJson.secure_url
+        .replace('/video/upload/', '/video/upload/f_mp3,br_24k/')
+        .replace(/\.[a-z0-9]+$/i, '.mp3');
+
+      res.json({ ok: true, url: playableUrl });
     } catch {
-      res.status(502).json({ ok: false, error: 'upload_unavailable' });
+      res.status(502).json({ ok: false, error: 'voice_upload_unavailable' });
     }
   });
 
@@ -712,7 +889,19 @@ self.addEventListener('notificationclick', function (event) {
         const incoming = data.message as Partial<DirectMessage> | undefined;
         if (!toUserId || !incoming || typeof incoming.id !== 'string') return;
         const text = typeof incoming.text === 'string' ? incoming.text.trim() : '';
-        if (!text) return;
+        const imageUrl =
+          typeof incoming.imageUrl === 'string' && incoming.imageUrl
+            ? incoming.imageUrl
+            : undefined;
+        const voiceUrl =
+          typeof incoming.voiceUrl === 'string' && incoming.voiceUrl
+            ? incoming.voiceUrl
+            : undefined;
+        const voiceDuration =
+          typeof incoming.voiceDuration === 'number'
+            ? incoming.voiceDuration
+            : undefined;
+        if (!text && !imageUrl && !voiceUrl) return;
 
         const dmId = makeDmId(meta.userId, toUserId);
         const senderProfile = users.get(meta.userId);
@@ -727,6 +916,9 @@ self.addEventListener('notificationclick', function (event) {
             senderProfile?.displayName ||
             (typeof incoming.senderName === 'string' ? incoming.senderName : 'User'),
           text,
+          ...(imageUrl ? { imageUrl } : {}),
+          ...(voiceUrl ? { voiceUrl } : {}),
+          ...(typeof voiceDuration === 'number' ? { voiceDuration } : {}),
           createdAt:
             typeof incoming.createdAt === 'number' ? incoming.createdAt : now,
           deliveredAt: recipientOnline ? now : undefined,
@@ -806,6 +998,9 @@ self.addEventListener('notificationclick', function (event) {
         const target = list.find((m) => m.id === messageId);
         if (!target || target.fromUserId !== meta.userId) return;
         target.text = '';
+        delete target.imageUrl;
+        delete target.voiceUrl;
+        delete target.voiceDuration;
         target.unsent = true;
         target.unsentAt = Date.now();
         delete target.replyTo;

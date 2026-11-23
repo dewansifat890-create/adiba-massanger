@@ -77,6 +77,8 @@ export interface DirectMessage {
   senderName: string;
   text: string;
   imageUrl?: string;
+  voiceUrl?: string;
+  voiceDuration?: number;
   createdAt: number;
   deliveredAt?: number;
   seenAt?: number;

@@ -606,10 +606,27 @@ export default function App() {
           },
           onMessagesUpdate: (dmId, msgs) => {
             if (cancelled) return;
-            setConversations((prev) => ({
-              ...prev,
-              [dmId]: msgs,
-            }));
+            setConversations((prev) => {
+              const existing = prev[dmId] ?? [];
+              const incomingIds = new Set(msgs.map((m) => m.id));
+              const cutoff = Date.now() - 15_000;
+              const pendingMine = existing.filter(
+                (m) =>
+                  m.fromUserId === fbUser.uid &&
+                  !incomingIds.has(m.id) &&
+                  m.createdAt >= cutoff
+              );
+              const merged =
+                pendingMine.length > 0
+                  ? [...msgs, ...pendingMine].sort(
+                      (a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id)
+                    )
+                  : msgs;
+              return {
+                ...prev,
+                [dmId]: merged,
+              };
+            });
 
             const incomingMsgs = msgs.filter((m) => m.fromUserId !== fbUser.uid);
             const latestIncoming = incomingMsgs[incomingMsgs.length - 1];
@@ -1429,7 +1446,12 @@ export default function App() {
         />
       ) : screen.type === 'messenger' ? (
         <MessengerWindow
-          currentUser={messengerUser}
+          currentUser={
+            auth?.currentUser &&
+            (firebaseStatus === 'ready' || firebaseStatus === 'permission-denied')
+              ? { ...messengerUser, userId: auth.currentUser.uid }
+              : messengerUser
+          }
           contacts={contacts}
           conversations={conversations}
           unreadCounts={unreadCounts}
@@ -1579,19 +1601,36 @@ export default function App() {
             toUserId,
             text,
             replyTo?: ChatReplyPreview,
-            imageUrl?: string
+            imageUrl?: string,
+            voiceUrl?: string,
+            voiceDuration?: number
           ) => {
-            const dmId = makeDmId(messengerUser.userId, toUserId);
+            const useFirebase =
+              Boolean(auth?.currentUser) &&
+              (firebaseStatus === 'ready' || firebaseStatus === 'permission-denied');
+            const senderUid =
+              useFirebase && auth?.currentUser
+                ? auth.currentUser.uid
+                : messengerUser.userId;
+            const dmId = makeDmId(senderUid, toUserId);
             const messageId = generateId();
+            const existingThread = conversations[dmId] ?? [];
+            const lastMsgTs =
+              existingThread.length > 0
+                ? existingThread[existingThread.length - 1].createdAt
+                : 0;
+            const createdAt = Math.max(Date.now(), lastMsgTs + 1);
             const msg: DirectMessage = {
               id: messageId,
               dmId,
-              fromUserId: messengerUser.userId,
+              fromUserId: senderUid,
               toUserId,
               senderName: messengerUser.displayName,
               text,
               ...(imageUrl ? { imageUrl } : {}),
-              createdAt: Date.now(),
+              ...(voiceUrl ? { voiceUrl } : {}),
+              ...(typeof voiceDuration === 'number' ? { voiceDuration } : {}),
+              createdAt,
               replyTo,
               reactions: [],
             };
@@ -1600,17 +1639,17 @@ export default function App() {
               [dmId]: [...(prev[dmId] ?? []), msg],
             }));
 
-            if (
-              auth?.currentUser &&
-              (firebaseStatus === 'ready' || firebaseStatus === 'permission-denied')
-            ) {
+            if (useFirebase && auth?.currentUser) {
               void sendFirebaseDirectMessage({
                 myUid: auth.currentUser.uid,
                 myName: messengerUser.displayName,
                 peerUid: toUserId,
                 text,
                 messageId,
+                createdAt,
                 imageUrl,
+                voiceUrl,
+                voiceDuration,
                 replyTo,
                 chatAlreadyExists: knownFirebaseChatsRef.current.has(dmId),
               })
@@ -1700,6 +1739,8 @@ export default function App() {
                       ...m,
                       text: '',
                       imageUrl: undefined,
+                      voiceUrl: undefined,
+                      voiceDuration: undefined,
                       unsent: true,
                       unsentAt: now,
                       replyTo: undefined,

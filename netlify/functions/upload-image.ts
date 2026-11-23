@@ -1,8 +1,14 @@
-import { createVerify } from 'node:crypto';
+import { createHash, createVerify } from 'node:crypto';
 
 interface CachedCerts {
   certs: Record<string, string>;
   expiresAt: number;
+}
+
+interface CloudinaryCreds {
+  cloudName: string;
+  apiKey: string;
+  apiSecret: string;
 }
 
 const GOOGLE_CERTS_URL =
@@ -100,6 +106,139 @@ async function verifyFirebaseIdToken(
   return payload.sub;
 }
 
+function getCloudinaryCreds(): CloudinaryCreds | null {
+  const rawUrl = process.env.CLOUDINARY_URL?.trim();
+  if (rawUrl) {
+    const match = rawUrl.match(/^cloudinary:\/\/([^:]+):([^@]+)@([^/\s]+)$/i);
+    if (match) {
+      return {
+        apiKey: decodeURIComponent(match[1]),
+        apiSecret: decodeURIComponent(match[2]),
+        cloudName: decodeURIComponent(match[3]),
+      };
+    }
+  }
+  const cloudName = process.env.CLOUDINARY_CLOUD_NAME?.trim() || '';
+  const apiKey = process.env.CLOUDINARY_API_KEY?.trim() || '';
+  const apiSecret = process.env.CLOUDINARY_API_SECRET?.trim() || '';
+  if (cloudName && apiKey && apiSecret) {
+    return { cloudName, apiKey, apiSecret };
+  }
+  return null;
+}
+
+async function uploadToImgbb(
+  imgbbKey: string,
+  cleanBase64: string,
+  mimeType: string,
+  cleanName: string
+): Promise<{ ok: true; url: string; thumbUrl: string } | { ok: false; error: string }> {
+  const ext = mimeType.includes('png')
+    ? 'png'
+    : mimeType.includes('webp')
+    ? 'webp'
+    : 'jpg';
+  const binary = Buffer.from(cleanBase64, 'base64');
+
+  const form = new FormData();
+  form.append('key', imgbbKey);
+  form.append('image', new Blob([binary], { type: mimeType }), `${cleanName}.${ext}`);
+  form.append('name', cleanName);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const uploadRes = await fetch(IMGBB_UPLOAD_URL, {
+      method: 'POST',
+      body: form,
+      signal: controller.signal,
+    });
+    const uploadJson = (await uploadRes.json().catch(() => ({}))) as {
+      success?: boolean;
+      data?: {
+        url?: string;
+        display_url?: string;
+        thumb?: { url?: string };
+      };
+      error?: { message?: string };
+    };
+    const imageUrl = uploadJson.data?.display_url || uploadJson.data?.url;
+    if (uploadRes.ok && uploadJson.success && imageUrl) {
+      return {
+        ok: true,
+        url: imageUrl,
+        thumbUrl: uploadJson.data?.thumb?.url || imageUrl,
+      };
+    }
+    return {
+      ok: false,
+      error: uploadJson.error?.message || `imgbb_http_${uploadRes.status}`,
+    };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'imgbb_network_error',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function uploadImageToCloudinary(
+  creds: CloudinaryCreds,
+  cleanBase64: string,
+  mimeType: string,
+  cleanName: string
+): Promise<{ ok: true; url: string; thumbUrl: string } | { ok: false; error: string }> {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const folder = 'notepad_images';
+  const toSign = `folder=${folder}&timestamp=${timestamp}${creds.apiSecret}`;
+  const signature = createHash('sha1').update(toSign).digest('hex');
+
+  const binary = Buffer.from(cleanBase64, 'base64');
+  const form = new FormData();
+  form.append('file', new Blob([binary], { type: mimeType }), `${cleanName}.jpg`);
+  form.append('api_key', creds.apiKey);
+  form.append('timestamp', String(timestamp));
+  form.append('folder', folder);
+  form.append('signature', signature);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const res = await fetch(
+      `https://api.cloudinary.com/v1_1/${encodeURIComponent(creds.cloudName)}/image/upload`,
+      {
+        method: 'POST',
+        body: form,
+        signal: controller.signal,
+      }
+    );
+    const json = (await res.json().catch(() => ({}))) as {
+      secure_url?: string;
+      error?: { message?: string };
+    };
+    if (res.ok && json.secure_url) {
+      return {
+        ok: true,
+        url: json.secure_url,
+        thumbUrl: json.secure_url,
+      };
+    }
+    return {
+      ok: false,
+      error: json.error?.message || `cloudinary_http_${res.status}`,
+    };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'cloudinary_network_error',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export default async (req: Request): Promise<Response> => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -108,12 +247,11 @@ export default async (req: Request): Promise<Response> => {
     return jsonResponse({ ok: false, error: 'Method not allowed' }, 405);
   }
 
-  const imgbbKey = process.env.IMGBB_API_KEY?.trim();
-  if (!imgbbKey) {
-    return jsonResponse(
-      { ok: false, error: 'missing_imgbb_api_key' },
-      503
-    );
+  const imgbbKey = process.env.IMGBB_API_KEY?.trim() || '';
+  const cloudinaryCreds = getCloudinaryCreds();
+
+  if (!imgbbKey && !cloudinaryCreds) {
+    return jsonResponse({ ok: false, error: 'missing_imgbb_api_key' }, 503);
   }
 
   const authHeader = req.headers.get('authorization') || '';
@@ -145,6 +283,8 @@ export default async (req: Request): Promise<Response> => {
 
   const rawBase64 =
     typeof body.imageBase64 === 'string' ? body.imageBase64.trim() : '';
+  const mimeMatch = rawBase64.match(/^data:(image\/[a-zA-Z0-9+.-]+);base64,/);
+  const mimeType = mimeMatch ? mimeMatch[1] : 'image/jpeg';
   const cleanBase64 = rawBase64.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, '');
 
   if (!cleanBase64 || cleanBase64.length > 2_000_000) {
@@ -156,49 +296,41 @@ export default async (req: Request): Promise<Response> => {
       ? body.name.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48)
       : `img_${Date.now()}`;
 
-  try {
-    const form = new URLSearchParams();
-    form.set('image', cleanBase64);
-    if (cleanName) {
-      form.set('name', cleanName);
-    }
+  let lastError = 'upload_unavailable';
 
-    const uploadRes = await fetch(
-      `${IMGBB_UPLOAD_URL}?key=${encodeURIComponent(imgbbKey)}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: form.toString(),
-      }
+  if (imgbbKey) {
+    const imgbbResult = await uploadToImgbb(
+      imgbbKey,
+      cleanBase64,
+      mimeType,
+      cleanName
     );
-
-    const uploadJson = (await uploadRes.json().catch(() => ({}))) as {
-      success?: boolean;
-      data?: {
-        url?: string;
-        display_url?: string;
-        thumb?: { url?: string };
-      };
-      error?: { message?: string };
-    };
-
-    const imageUrl = uploadJson.data?.display_url || uploadJson.data?.url;
-    if (!uploadRes.ok || !uploadJson.success || !imageUrl) {
-      return jsonResponse(
-        {
-          ok: false,
-          error: uploadJson.error?.message || 'imgbb_upload_failed',
-        },
-        502
-      );
+    if (imgbbResult.ok) {
+      return jsonResponse({
+        ok: true,
+        url: imgbbResult.url,
+        thumbUrl: imgbbResult.thumbUrl,
+      });
     }
-
-    return jsonResponse({
-      ok: true,
-      url: imageUrl,
-      thumbUrl: uploadJson.data?.thumb?.url || imageUrl,
-    });
-  } catch {
-    return jsonResponse({ ok: false, error: 'upload_unavailable' }, 502);
+    lastError = imgbbResult.error;
   }
+
+  if (cloudinaryCreds) {
+    const cloudResult = await uploadImageToCloudinary(
+      cloudinaryCreds,
+      cleanBase64,
+      mimeType,
+      cleanName
+    );
+    if (cloudResult.ok) {
+      return jsonResponse({
+        ok: true,
+        url: cloudResult.url,
+        thumbUrl: cloudResult.thumbUrl,
+      });
+    }
+    lastError = cloudResult.error;
+  }
+
+  return jsonResponse({ ok: false, error: lastError }, 502);
 };

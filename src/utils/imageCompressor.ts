@@ -77,8 +77,8 @@ export async function compressImageToFewKb(
 ): Promise<CompressedImageResult> {
   const decoded = await decodeImageElement(file);
   try {
-    const dimensionSteps = [1200, 960, 760, 580];
-    const qualitySteps = [0.78, 0.62, 0.48, 0.34, 0.25];
+    const dimensionSteps = [1200, 960, 760, 580, 420];
+    const qualitySteps = [0.78, 0.62, 0.48, 0.34, 0.24];
 
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d');
@@ -86,14 +86,8 @@ export async function compressImageToFewKb(
       throw new Error('Canvas 2D unavailable');
     }
 
-    // Prefer WebP when supported for significantly smaller KB size, fallback to JPEG
-    let preferredMime = 'image/webp';
-    canvas.width = 4;
-    canvas.height = 4;
-    const probe = await canvasToBlob(canvas, preferredMime, 0.7);
-    if (!probe || probe.type !== 'image/webp') {
-      preferredMime = 'image/jpeg';
-    }
+    // JPEG has universal support across ImgBB, Cloudinary, and all mobile browsers
+    const preferredMime = 'image/jpeg';
 
     let bestBlob: Blob | null = null;
     let bestW = decoded.width;

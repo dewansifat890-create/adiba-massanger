@@ -488,34 +488,58 @@ export function subscribeToFirebaseChats(
             (msgSnap) => {
               msgRetryCounts.delete(chatId);
               callbacks.onRecovered?.();
-              const msgs: DirectMessage[] = msgSnap.docs.map((d) => {
-                const m = d.data() as Partial<DirectMessage> & {
-                  senderId?: string;
-                };
-                return {
-                  id: d.id,
-                  dmId: chatId,
-                  fromUserId: m.fromUserId || m.senderId || '',
-                  toUserId: m.toUserId || '',
-                  senderName: m.senderName || 'User',
-                  text: m.text || '',
-                  imageUrl:
+              const msgs: DirectMessage[] = msgSnap.docs
+                .map((d) => {
+                  const m = d.data() as Partial<DirectMessage> & {
+                    senderId?: string;
+                  };
+                  const text = typeof m.text === 'string' ? m.text : '';
+                  const imageUrl =
                     typeof m.imageUrl === 'string' && m.imageUrl
                       ? m.imageUrl
-                      : undefined,
-                  createdAt:
-                    typeof m.createdAt === 'number' ? m.createdAt : Date.now(),
-                  unsent: Boolean(m.unsent),
-                  unsentAt:
-                    typeof m.unsentAt === 'number' ? m.unsentAt : undefined,
-                  replyTo: m.unsent ? undefined : m.replyTo,
-                  reactions: m.unsent
-                    ? []
-                    : Array.isArray(m.reactions)
-                    ? m.reactions
-                    : [],
-                };
-              });
+                      : undefined;
+                  const voiceUrl =
+                    typeof m.voiceUrl === 'string' && m.voiceUrl
+                      ? m.voiceUrl
+                      : undefined;
+                  const voiceDuration =
+                    typeof m.voiceDuration === 'number'
+                      ? m.voiceDuration
+                      : undefined;
+                  const unsent = Boolean(m.unsent);
+                  return {
+                    id: d.id,
+                    dmId: chatId,
+                    fromUserId: m.fromUserId || m.senderId || '',
+                    toUserId: m.toUserId || '',
+                    senderName: m.senderName || 'User',
+                    text,
+                    imageUrl,
+                    voiceUrl,
+                    voiceDuration,
+                    createdAt:
+                      typeof m.createdAt === 'number' ? m.createdAt : Date.now(),
+                    unsent,
+                    unsentAt:
+                      typeof m.unsentAt === 'number' ? m.unsentAt : undefined,
+                    replyTo: unsent ? undefined : m.replyTo,
+                    reactions: unsent
+                      ? []
+                      : Array.isArray(m.reactions)
+                      ? m.reactions
+                      : [],
+                  };
+                })
+                .filter(
+                  (m) =>
+                    m.unsent ||
+                    m.text.trim().length > 0 ||
+                    Boolean(m.imageUrl) ||
+                    Boolean(m.voiceUrl)
+                )
+                .sort(
+                  (a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id)
+                );
 
               const wasInitialized = initialLoadedChats.has(chatId);
               if (!wasInitialized) {
@@ -573,7 +597,7 @@ export function subscribeToFirebaseChats(
           messageUnsubs.set(chatId, unsubMsgs);
         };
 
-        if (!messageUnsubs.has(chatId) && !chatDoc.metadata.hasPendingWrites) {
+        if (!messageUnsubs.has(chatId)) {
           attachMessagesListener();
         }
       });
@@ -936,7 +960,12 @@ export async function uploadCompressedChatImage(
   imageBase64: string,
   name?: string
 ): Promise<string> {
-  const idToken = await auth?.currentUser?.getIdToken();
+  let user = auth?.currentUser ?? null;
+  if (!user) {
+    const signedIn = await ensureFirebaseSignedIn();
+    user = signedIn.user;
+  }
+  const idToken = await user?.getIdToken();
   const res = await fetch('/api/upload-image', {
     method: 'POST',
     headers: {
@@ -952,7 +981,38 @@ export async function uploadCompressedChatImage(
     error?: string;
   };
   if (!res.ok || !data.ok || !data.url) {
-    throw new Error(data.error || 'Image upload failed');
+    throw new Error(data.error || `image_upload_http_${res.status}`);
+  }
+  return data.url;
+}
+
+export async function uploadCompressedChatVoice(
+  audioBase64: string,
+  mimeType: string,
+  name?: string
+): Promise<string> {
+  let user = auth?.currentUser ?? null;
+  if (!user) {
+    const signedIn = await ensureFirebaseSignedIn();
+    user = signedIn.user;
+  }
+  const idToken = await user?.getIdToken();
+  const res = await fetch('/api/upload-voice', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+    },
+    body: JSON.stringify({ audioBase64, mimeType, name }),
+  });
+
+  const data = (await res.json().catch(() => ({}))) as {
+    ok?: boolean;
+    url?: string;
+    error?: string;
+  };
+  if (!res.ok || !data.ok || !data.url) {
+    throw new Error(data.error || `voice_upload_http_${res.status}`);
   }
   return data.url;
 }
@@ -983,7 +1043,10 @@ export async function sendFirebaseDirectMessage(params: {
   peerUid: string;
   text: string;
   messageId: string;
+  createdAt?: number;
   imageUrl?: string;
+  voiceUrl?: string;
+  voiceDuration?: number;
   replyTo?: ChatReplyPreview;
   chatAlreadyExists: boolean;
 }): Promise<void> {
@@ -994,14 +1057,19 @@ export async function sendFirebaseDirectMessage(params: {
     peerUid,
     text,
     messageId,
+    createdAt,
     imageUrl,
+    voiceUrl,
+    voiceDuration,
     replyTo,
     chatAlreadyExists,
   } = params;
   const chatId = makeDmId(myUid, peerUid);
-  const now = Date.now();
+  const now = typeof createdAt === 'number' ? createdAt : Date.now();
   const chatRef = doc(db, 'chats', chatId);
-  const lastPreviewText = text.trim() || (imageUrl ? '📷 Photo' : '');
+  const lastPreviewText =
+    text.trim() ||
+    (voiceUrl ? '🎤 Voice message' : imageUrl ? '📷 Photo' : '');
 
   const msgPayload: Record<string, unknown> = {
     id: messageId,
@@ -1016,6 +1084,12 @@ export async function sendFirebaseDirectMessage(params: {
   };
   if (imageUrl) {
     msgPayload.imageUrl = imageUrl;
+  }
+  if (voiceUrl) {
+    msgPayload.voiceUrl = voiceUrl;
+  }
+  if (typeof voiceDuration === 'number' && Number.isFinite(voiceDuration)) {
+    msgPayload.voiceDuration = voiceDuration;
   }
   if (replyTo) {
     msgPayload.replyTo = replyTo;
@@ -1166,6 +1240,8 @@ export async function deleteFirebaseDirectMessage(
     await updateDoc(doc(db, 'chats', chatId, 'messages', messageId), {
       text: '',
       imageUrl: deleteField(),
+      voiceUrl: deleteField(),
+      voiceDuration: deleteField(),
       unsent: true,
       unsentAt: Date.now(),
       replyTo: deleteField(),
