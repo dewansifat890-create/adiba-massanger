@@ -505,15 +505,15 @@ export function MessengerWindow({
     const container = messagesScrollRef.current;
     if (!container) return;
     if (smooth) {
-      container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+      container.scrollTo({ top: 0, behavior: 'smooth' });
     } else {
-      container.scrollTop = container.scrollHeight;
+      container.scrollTop = 0;
     }
   };
 
   const lastMsgId = activeMessages[activeMessages.length - 1]?.id ?? null;
 
-  // Start directly at the latest message when entering a chat box (no top-to-bottom scroll)
+  // Anchor natively at latest message when entering a chat box (scrollTop = 0 in flex-col-reverse)
   useLayoutEffect(() => {
     if (!selectedPeerId) {
       prevOpenedPeerRef.current = null;
@@ -527,7 +527,7 @@ export function MessengerWindow({
     }
   }, [selectedPeerId, activeMessages.length]);
 
-  // Keep scrolled to bottom immediately when new messages arrive or are sent
+  // Keep anchored at bottom immediately when new messages arrive or are sent
   useLayoutEffect(() => {
     if (!selectedPeerId || prevOpenedPeerRef.current !== selectedPeerId) return;
     const prevCount = prevMsgCountRef.current;
@@ -545,8 +545,7 @@ export function MessengerWindow({
     if (!selectedPeerId) return;
     const container = messagesScrollRef.current;
     if (!container) return;
-    const isNearBottom =
-      container.scrollHeight - container.scrollTop - container.clientHeight < 90;
+    const isNearBottom = Math.abs(container.scrollTop) < 90;
     if (isNearBottom) {
       scrollMessagesToBottom(false);
     }
@@ -580,9 +579,7 @@ export function MessengerWindow({
 
     const syncViewport = () => {
       const container = messagesScrollRef.current;
-      const wasAtBottom = container
-        ? container.scrollHeight - container.scrollTop - container.clientHeight < 80
-        : false;
+      const wasAtBottom = container ? Math.abs(container.scrollTop) < 80 : false;
 
       if (window.scrollY !== 0 || window.scrollX !== 0) {
         window.scrollTo(0, 0);
@@ -770,14 +767,13 @@ export function MessengerWindow({
     } catch (err) {
       const msg = err instanceof Error ? err.message : '';
       if (msg === 'missing_imgbb_api_key') {
-        onShowToast('Set IMGBB_API_KEY or Cloudinary keys in server env');
-      } else if (
-        msg === 'missing_auth_token' ||
-        msg === 'invalid_auth_token'
-      ) {
+        onShowToast('Set IMGBB_API_KEY in Netlify environment variables');
+      } else if (/missing bearer|invalid auth/i.test(msg)) {
         onShowToast('Session expired — please reopen chat and try again');
       } else {
-        onShowToast('Could not upload image — please retry');
+        onShowToast(
+          msg ? `Image upload error: ${msg.slice(0, 60)}` : 'Could not upload image — please retry'
+        );
       }
     } finally {
       setUploadingImage(false);
@@ -899,8 +895,9 @@ export function MessengerWindow({
           return;
         }
 
+        const chunkMime = voiceChunksRef.current.find((c) => c.type)?.type;
         const finalMime =
-          recorder.mimeType || chosenMime || 'audio/webm';
+          chunkMime || recorder.mimeType || chosenMime || 'audio/webm';
         const blob = new Blob(voiceChunksRef.current, { type: finalMime });
         voiceChunksRef.current = [];
 
@@ -965,23 +962,8 @@ export function MessengerWindow({
     setVoiceState('uploading');
 
     try {
-      const base64 = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const result = typeof reader.result === 'string' ? reader.result : '';
-          const commaIdx = result.indexOf(',');
-          if (commaIdx === -1) {
-            reject(new Error('invalid_audio_read'));
-            return;
-          }
-          resolve(result.slice(commaIdx + 1));
-        };
-        reader.onerror = () => reject(new Error('audio_read_failed'));
-        reader.readAsDataURL(recordedVoice.blob);
-      });
-
       const voiceUrl = await uploadCompressedChatVoice(
-        base64,
+        recordedVoice.blob,
         recordedVoice.mimeType,
         `voice_${Date.now()}`
       );
@@ -1007,14 +989,17 @@ export function MessengerWindow({
     } catch (err) {
       const msg = err instanceof Error ? err.message : '';
       if (msg === 'missing_cloudinary_config') {
-        onShowToast('Set Cloudinary keys in Netlify environment variables');
-      } else if (
-        msg === 'missing_auth_token' ||
-        msg === 'invalid_auth_token'
-      ) {
+        onShowToast('Set CLOUDINARY_CLOUD_NAME, API_KEY & API_SECRET in Netlify');
+      } else if (/missing bearer|invalid auth/i.test(msg)) {
         onShowToast('Session expired — please reopen chat and try again');
+      } else if (/signature|api_key|api key|cloud_name/i.test(msg)) {
+        onShowToast(`Cloudinary config error: ${msg.slice(0, 60)}`);
       } else {
-        onShowToast('Could not send voice message — tap Send to retry');
+        onShowToast(
+          msg
+            ? `Voice upload failed: ${msg.slice(0, 60)}`
+            : 'Could not send voice message — tap Send to retry'
+        );
       }
       setVoiceState('recorded');
     }
@@ -1147,15 +1132,15 @@ export function MessengerWindow({
           </button>
         </header>
 
-        {/* Chat Messages */}
+        {/* Chat Messages (bottom-anchored via flex-col-reverse for zero scroll-jump) */}
         <main
           ref={messagesScrollRef}
-          className={`flex-1 min-h-0 overflow-y-auto overscroll-y-contain no-scrollbar w-full mx-auto px-3.5 pt-3 pb-4 ${
+          className={`flex-1 min-h-0 overflow-y-auto overscroll-y-contain no-scrollbar w-full mx-auto px-3.5 pt-3 pb-4 flex flex-col-reverse ${
             isMobileFrame ? '' : 'max-w-3xl'
           }`}
         >
           {activeMessages.length === 0 ? (
-            <div className="min-h-full flex flex-col items-center justify-center pb-12 text-center">
+            <div className="m-auto flex flex-col items-center justify-center pb-12 text-center">
               <div className="w-14 h-14 rounded-full bg-blue-600/15 text-blue-500 flex items-center justify-center font-bold text-xl mb-3">
                 {selectedPeer.displayName.slice(0, 1).toUpperCase()}
               </div>
@@ -1167,16 +1152,32 @@ export function MessengerWindow({
               </p>
             </div>
           ) : (
-            <div className="flex flex-col gap-4">
-              {groupedMessages.map((group) => (
-                <div key={group.day} className="flex flex-col gap-2 shrink-0">
-                  <div className="text-center py-1 shrink-0">
-                    <span className="text-[11px] font-medium text-slate-400 dark:text-zinc-500">
-                      {group.day}
-                    </span>
-                  </div>
+            <>
+              <div ref={bottomRef} className="shrink-0" />
 
-                  {group.items.map((msg) => {
+              {isPeerTyping && (
+                <div className="mt-3 flex items-start shrink-0">
+                  <div className="px-3.5 py-2.5 rounded-2xl rounded-bl-md bg-white dark:bg-[#1C1C1E] border border-slate-200/80 dark:border-white/[0.08] flex items-center gap-1.5 shadow-xs">
+                    <span
+                      className="w-2 h-2 rounded-full bg-slate-400 dark:bg-zinc-400 animate-bounce"
+                      style={{ animationDelay: '0ms' }}
+                    />
+                    <span
+                      className="w-2 h-2 rounded-full bg-slate-400 dark:bg-zinc-400 animate-bounce"
+                      style={{ animationDelay: '160ms' }}
+                    />
+                    <span
+                      className="w-2 h-2 rounded-full bg-slate-400 dark:bg-zinc-400 animate-bounce"
+                      style={{ animationDelay: '320ms' }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              <div className="flex flex-col-reverse gap-4 shrink-0">
+                {[...groupedMessages].reverse().map((group) => (
+                  <div key={group.day} className="flex flex-col-reverse gap-2 shrink-0">
+                    {[...group.items].reverse().map((msg) => {
                     const isUnsent = Boolean(msg.unsent);
                     if (
                       !isUnsent &&
@@ -1303,6 +1304,7 @@ export function MessengerWindow({
                                   src={msg.imageUrl}
                                   alt="Shared attachment"
                                   loading="lazy"
+                                  decoding="async"
                                   className="w-full max-w-[250px] max-h-[310px] object-cover rounded-xl block"
                                 />
                               </button>
@@ -1415,31 +1417,16 @@ export function MessengerWindow({
                       </div>
                     );
                   })}
-                </div>
-              ))}
-            </div>
-          )}
-
-          {isPeerTyping && (
-            <div className="mt-3 flex items-start">
-              <div className="px-3.5 py-2.5 rounded-2xl rounded-bl-md bg-white dark:bg-[#1C1C1E] border border-slate-200/80 dark:border-white/[0.08] flex items-center gap-1.5 shadow-xs">
-                <span
-                  className="w-2 h-2 rounded-full bg-slate-400 dark:bg-zinc-400 animate-bounce"
-                  style={{ animationDelay: '0ms' }}
-                />
-                <span
-                  className="w-2 h-2 rounded-full bg-slate-400 dark:bg-zinc-400 animate-bounce"
-                  style={{ animationDelay: '160ms' }}
-                />
-                <span
-                  className="w-2 h-2 rounded-full bg-slate-400 dark:bg-zinc-400 animate-bounce"
-                  style={{ animationDelay: '320ms' }}
-                />
+                    <div className="text-center py-1 shrink-0">
+                      <span className="text-[11px] font-medium text-slate-400 dark:text-zinc-500">
+                        {group.day}
+                      </span>
+                    </div>
+                  </div>
+                ))}
               </div>
-            </div>
+            </>
           )}
-
-          <div ref={bottomRef} />
         </main>
 
         {/* Bottom Messenger Input Bar */}

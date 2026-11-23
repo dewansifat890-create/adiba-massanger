@@ -251,15 +251,19 @@ self.addEventListener('push', function (event) {
       if (messageId) rememberNotifiedId(messageId);
       if (willShowInSw) {
         var notifTag = messageId ? ('notepad-msg-' + messageId) : ('notepad-reminder-' + Date.now());
-        return self.registration.showNotification(title, {
+        var notifOpts = {
           body: body,
           icon: '/pwa-192x192.png',
           badge: '/pwa-192x192.png',
           tag: notifTag,
-          renotify: false,
+          renotify: true,
           silent: Boolean(isMuted),
           data: { url: url, fromUserId: fromUserId, messageId: messageId }
-        });
+        };
+        if (!isMuted) {
+          notifOpts.vibrate = [160, 80, 160];
+        }
+        return self.registration.showNotification(title, notifOpts);
       }
     })
   );
@@ -347,8 +351,32 @@ self.addEventListener('notificationclick', function (event) {
         return;
       }
 
-      const fcmToken = recipientDoc.data()?.fcmToken;
-      if (typeof fcmToken !== 'string' || !fcmToken) {
+      const userData = recipientDoc.data() as
+        | { fcmToken?: string; fcmTokens?: Record<string, unknown> }
+        | undefined;
+      const targetMap = new Map<
+        string,
+        { token: string; deviceKeys: string[]; matchesLegacy: boolean }
+      >();
+      if (userData?.fcmTokens && typeof userData.fcmTokens === 'object') {
+        for (const [dk, val] of Object.entries(userData.fcmTokens)) {
+          if (typeof val === 'string' && val.trim()) {
+            const tok = val.trim();
+            const existing = targetMap.get(tok);
+            if (existing) existing.deviceKeys.push(dk);
+            else targetMap.set(tok, { token: tok, deviceKeys: [dk], matchesLegacy: false });
+          }
+        }
+      }
+      if (typeof userData?.fcmToken === 'string' && userData.fcmToken.trim()) {
+        const tok = userData.fcmToken.trim();
+        const existing = targetMap.get(tok);
+        if (existing) existing.matchesLegacy = true;
+        else targetMap.set(tok, { token: tok, deviceKeys: [], matchesLegacy: true });
+      }
+
+      const targets = Array.from(targetMap.values());
+      if (targets.length === 0) {
         res.json({ ok: true, pushed: false, reason: 'no_fcm_token' });
         return;
       }
@@ -356,87 +384,140 @@ self.addEventListener('notificationclick', function (event) {
       const tagId = cleanMsgId
         ? `notepad-msg-${cleanMsgId}`
         : `notepad-reminder-${Date.now()}`;
-      await getAdminMessaging(adminApp).send({
-        token: fcmToken,
-        notification: {
-          title: 'NotePad',
-          body: 'You have a new note reminder',
-        },
-        data: {
-          title: 'NotePad',
-          body: 'You have a new note reminder',
-          url: '/',
-          fromUserId: callerUid,
-          ...(cleanMsgId ? { messageId: cleanMsgId } : {}),
-        },
-        webpush: {
-          headers: {
-            Urgency: 'high',
-            TTL: '86400',
-          },
-          notification: {
-            title: 'NotePad',
-            body: 'You have a new note reminder',
-            icon: '/pwa-192x192.png',
-            badge: '/pwa-192x192.png',
-            tag: tagId,
-            renotify: false,
-          },
-          fcmOptions: {
-            link: '/',
-          },
-        },
-      });
+      const messagingAdmin = getAdminMessaging(adminApp);
+      const sendResults = await Promise.all(
+        targets.map(async (target) => {
+          try {
+            await messagingAdmin.send({
+              token: target.token,
+              notification: {
+                title: 'NotePad',
+                body: 'You have a new note reminder',
+              },
+              data: {
+                title: 'NotePad',
+                body: 'You have a new note reminder',
+                url: '/',
+                fromUserId: callerUid,
+                ...(cleanMsgId ? { messageId: cleanMsgId } : {}),
+              },
+              webpush: {
+                headers: {
+                  Urgency: 'high',
+                  TTL: '86400',
+                },
+                notification: {
+                  title: 'NotePad',
+                  body: 'You have a new note reminder',
+                  icon: '/pwa-192x192.png',
+                  badge: '/pwa-192x192.png',
+                  tag: tagId,
+                  renotify: true,
+                },
+                fcmOptions: {
+                  link: '/',
+                },
+              },
+            });
+            return { ok: true as const, target };
+          } catch (err: unknown) {
+            const errCode =
+              typeof err === 'object' && err !== null && 'code' in err
+                ? String((err as { code: unknown }).code)
+                : 'push_unavailable';
+            const isInvalid =
+              errCode === 'messaging/registration-token-not-registered' ||
+              errCode === 'messaging/invalid-registration-token';
+            return { ok: false as const, target, errCode, isInvalid };
+          }
+        })
+      );
 
-      res.json({ ok: true, pushed: true });
+      let sentCount = 0;
+      let lastErrCode = 'push_unavailable';
+      const cleanupPatch: Record<string, unknown> = {};
+      for (const r of sendResults) {
+        if (r.ok) {
+          sentCount += 1;
+        } else {
+          lastErrCode = r.errCode;
+          if (r.isInvalid) {
+            if (r.target.matchesLegacy) cleanupPatch.fcmToken = null;
+            for (const dk of r.target.deviceKeys) {
+              if (/^[A-Za-z0-9_-]{1,64}$/.test(dk)) {
+                cleanupPatch[`fcmTokens.${dk}`] = null;
+              }
+            }
+          }
+        }
+      }
+
+      if (Object.keys(cleanupPatch).length > 0) {
+        await adminDb
+          .collection('users')
+          .doc(toUserId)
+          .update(cleanupPatch)
+          .catch(() => {});
+      }
+
+      if (sentCount > 0) {
+        res.json({ ok: true, pushed: true, sentCount });
+      } else {
+        console.warn('FCM reminder send skipped:', lastErrCode);
+        res.json({ ok: true, pushed: false, reason: lastErrCode });
+      }
     } catch (err: unknown) {
       const errCode =
         typeof err === 'object' && err !== null && 'code' in err
           ? String((err as { code: unknown }).code)
           : 'push_unavailable';
-      if (
-        errCode === 'messaging/registration-token-not-registered' ||
-        errCode === 'messaging/invalid-registration-token'
-      ) {
-        try {
-          await getAdminFirestore(adminApp)
-            .collection('users')
-            .doc(toUserId)
-            .set({ fcmToken: null }, { merge: true });
-        } catch {
-          // Ignore cleanup error
-        }
-      }
       console.warn('FCM reminder send skipped:', errCode);
       res.json({ ok: true, pushed: false, reason: errCode });
     }
   });
 
+  const cleanEnvValue = (raw?: string): string =>
+    (raw || '').trim().replace(/^['"]+|['"]+$/g, '').trim();
+
   const getCloudinaryCreds = () => {
-    const rawUrl = process.env.CLOUDINARY_URL?.trim();
+    let rawUrl = cleanEnvValue(process.env.CLOUDINARY_URL);
+    if (rawUrl.toUpperCase().startsWith('CLOUDINARY_URL=')) {
+      rawUrl = rawUrl.slice('CLOUDINARY_URL='.length).trim();
+    }
     if (rawUrl) {
-      const match = rawUrl.match(/^cloudinary:\/\/([^:]+):([^@]+)@([^/\s]+)$/i);
+      const match = rawUrl.match(/^cloudinary:\/\/([^:]+):([^@]+)@([^/\s?#]+)$/i);
       if (match) {
         return {
-          apiKey: decodeURIComponent(match[1]),
-          apiSecret: decodeURIComponent(match[2]),
-          cloudName: decodeURIComponent(match[3]),
+          apiKey: decodeURIComponent(match[1]).trim(),
+          apiSecret: decodeURIComponent(match[2]).trim(),
+          cloudName: decodeURIComponent(match[3]).trim(),
         };
       }
     }
-    const cloudName = process.env.CLOUDINARY_CLOUD_NAME?.trim() || '';
-    const apiKey = process.env.CLOUDINARY_API_KEY?.trim() || '';
-    const apiSecret = process.env.CLOUDINARY_API_SECRET?.trim() || '';
+    const cloudName = cleanEnvValue(process.env.CLOUDINARY_CLOUD_NAME);
+    const apiKey = cleanEnvValue(process.env.CLOUDINARY_API_KEY);
+    const apiSecret = cleanEnvValue(process.env.CLOUDINARY_API_SECRET);
     if (cloudName && apiKey && apiSecret) {
       return { cloudName, apiKey, apiSecret };
     }
     return null;
   };
 
+  const signCloudinaryVoice = (creds: {
+    cloudName: string;
+    apiKey: string;
+    apiSecret: string;
+  }) => {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const folder = 'notepad_voice';
+    const toSign = `folder=${folder}&timestamp=${timestamp}${creds.apiSecret}`;
+    const signature = createHash('sha1').update(toSign).digest('hex');
+    return { timestamp, folder, signature };
+  };
+
   app.post('/api/upload-image', async (req, res) => {
-    const imgbbKey = process.env.IMGBB_API_KEY?.trim() || '';
-    const cloudinaryCreds = getCloudinaryCreds();
-    if (!imgbbKey && !cloudinaryCreds) {
+    const imgbbKey = cleanEnvValue(process.env.IMGBB_API_KEY);
+    if (!imgbbKey) {
       res.status(503).json({ ok: false, error: 'missing_imgbb_api_key' });
       return;
     }
@@ -480,91 +561,49 @@ self.addEventListener('notificationclick', function (event) {
         ? req.body.name.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48)
         : `img_${Date.now()}`;
     const binary = Buffer.from(cleanBase64, 'base64');
-    let lastError = 'upload_unavailable';
 
-    if (imgbbKey) {
-      try {
-        const form = new FormData();
-        form.append('key', imgbbKey);
-        form.append(
-          'image',
-          new Blob([binary], { type: mimeType }),
-          `${cleanName}.jpg`
-        );
-        form.append('name', cleanName);
+    try {
+      const form = new FormData();
+      form.append('key', imgbbKey);
+      form.append(
+        'image',
+        new Blob([binary], { type: mimeType }),
+        `${cleanName}.jpg`
+      );
+      form.append('name', cleanName);
 
-        const uploadRes = await fetch('https://api.imgbb.com/1/upload', {
-          method: 'POST',
-          body: form,
+      const uploadRes = await fetch('https://api.imgbb.com/1/upload', {
+        method: 'POST',
+        body: form,
+      });
+      const uploadJson = (await uploadRes.json().catch(() => ({}))) as {
+        success?: boolean;
+        data?: {
+          url?: string;
+          display_url?: string;
+          thumb?: { url?: string };
+        };
+        error?: { message?: string };
+      };
+      const imageUrl = uploadJson.data?.display_url || uploadJson.data?.url;
+      if (uploadRes.ok && uploadJson.success && imageUrl) {
+        res.json({
+          ok: true,
+          url: imageUrl,
+          thumbUrl: uploadJson.data?.thumb?.url || imageUrl,
         });
-        const uploadJson = (await uploadRes.json().catch(() => ({}))) as {
-          success?: boolean;
-          data?: {
-            url?: string;
-            display_url?: string;
-            thumb?: { url?: string };
-          };
-          error?: { message?: string };
-        };
-        const imageUrl = uploadJson.data?.display_url || uploadJson.data?.url;
-        if (uploadRes.ok && uploadJson.success && imageUrl) {
-          res.json({
-            ok: true,
-            url: imageUrl,
-            thumbUrl: uploadJson.data?.thumb?.url || imageUrl,
-          });
-          return;
-        }
-        lastError = uploadJson.error?.message || `imgbb_http_${uploadRes.status}`;
-      } catch (err: unknown) {
-        lastError = err instanceof Error ? err.message : 'imgbb_network_error';
+        return;
       }
+      res.status(502).json({
+        ok: false,
+        error: uploadJson.error?.message || `imgbb_http_${uploadRes.status}`,
+      });
+    } catch (err: unknown) {
+      res.status(502).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'imgbb_network_error',
+      });
     }
-
-    if (cloudinaryCreds) {
-      try {
-        const timestamp = Math.floor(Date.now() / 1000);
-        const folder = 'notepad_images';
-        const toSign = `folder=${folder}&timestamp=${timestamp}${cloudinaryCreds.apiSecret}`;
-        const signature = createHash('sha1').update(toSign).digest('hex');
-
-        const form = new FormData();
-        form.append(
-          'file',
-          new Blob([binary], { type: mimeType }),
-          `${cleanName}.jpg`
-        );
-        form.append('api_key', cloudinaryCreds.apiKey);
-        form.append('timestamp', String(timestamp));
-        form.append('folder', folder);
-        form.append('signature', signature);
-
-        const uploadRes = await fetch(
-          `https://api.cloudinary.com/v1_1/${encodeURIComponent(
-            cloudinaryCreds.cloudName
-          )}/image/upload`,
-          { method: 'POST', body: form }
-        );
-        const uploadJson = (await uploadRes.json().catch(() => ({}))) as {
-          secure_url?: string;
-          error?: { message?: string };
-        };
-        if (uploadRes.ok && uploadJson.secure_url) {
-          res.json({
-            ok: true,
-            url: uploadJson.secure_url,
-            thumbUrl: uploadJson.secure_url,
-          });
-          return;
-        }
-        lastError =
-          uploadJson.error?.message || `cloudinary_http_${uploadRes.status}`;
-      } catch (err: unknown) {
-        lastError = err instanceof Error ? err.message : 'cloudinary_network_error';
-      }
-    }
-
-    res.status(502).json({ ok: false, error: lastError });
   });
 
   app.post('/api/upload-voice', async (req, res) => {
@@ -591,6 +630,20 @@ self.addEventListener('notificationclick', function (event) {
       }
     }
 
+    if (req.body?.mode === 'sign') {
+      const signed = signCloudinaryVoice(creds);
+      res.json({
+        ok: true,
+        mode: 'signed',
+        cloudName: creds.cloudName,
+        apiKey: creds.apiKey,
+        timestamp: signed.timestamp,
+        folder: signed.folder,
+        signature: signed.signature,
+      });
+      return;
+    }
+
     const rawBase64 =
       typeof req.body?.audioBase64 === 'string'
         ? req.body.audioBase64.trim()
@@ -608,38 +661,18 @@ self.addEventListener('notificationclick', function (event) {
       ''
     );
 
-    if (!cleanBase64 || cleanBase64.length > 5_000_000) {
+    if (!cleanBase64 || cleanBase64.length > 4_800_000) {
       res
         .status(400)
         .json({ ok: false, error: 'Invalid or oversized audio payload' });
       return;
     }
 
-    const cleanName =
-      typeof req.body?.name === 'string' && req.body.name.trim()
-        ? req.body.name.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48)
-        : `voice_${Date.now()}`;
-    const ext = mimeType.includes('mp4')
-      ? 'm4a'
-      : mimeType.includes('ogg')
-      ? 'ogg'
-      : mimeType.includes('mpeg') || mimeType.includes('mp3')
-      ? 'mp3'
-      : 'webm';
-
-    try {
-      const timestamp = Math.floor(Date.now() / 1000);
-      const folder = 'notepad_voice';
-      const toSign = `folder=${folder}&timestamp=${timestamp}${creds.apiSecret}`;
-      const signature = createHash('sha1').update(toSign).digest('hex');
-
-      const binary = Buffer.from(cleanBase64, 'base64');
+    const dataUri = `data:${mimeType};base64,${cleanBase64}`;
+    const attemptCloudinary = async (resourceType: 'video' | 'raw') => {
+      const { timestamp, folder, signature } = signCloudinaryVoice(creds);
       const form = new FormData();
-      form.append(
-        'file',
-        new Blob([binary], { type: mimeType }),
-        `${cleanName}.${ext}`
-      );
+      form.append('file', dataUri);
       form.append('api_key', creds.apiKey);
       form.append('timestamp', String(timestamp));
       form.append('folder', folder);
@@ -648,26 +681,43 @@ self.addEventListener('notificationclick', function (event) {
       const uploadRes = await fetch(
         `https://api.cloudinary.com/v1_1/${encodeURIComponent(
           creds.cloudName
-        )}/video/upload`,
+        )}/${resourceType}/upload`,
         { method: 'POST', body: form }
       );
       const uploadJson = (await uploadRes.json().catch(() => ({}))) as {
         secure_url?: string;
         error?: { message?: string };
       };
-      if (!uploadRes.ok || !uploadJson.secure_url) {
-        res.status(502).json({
-          ok: false,
-          error: uploadJson.error?.message || `cloudinary_http_${uploadRes.status}`,
-        });
+      if (uploadRes.ok && uploadJson.secure_url) {
+        const playableUrl =
+          resourceType === 'video'
+            ? uploadJson.secure_url
+                .replace('/video/upload/', '/video/upload/f_mp3,br_24k/')
+                .replace(/\.[a-z0-9]+$/i, '.mp3')
+            : uploadJson.secure_url;
+        return { ok: true as const, url: playableUrl };
+      }
+      return {
+        ok: false as const,
+        status: uploadRes.status,
+        error: uploadJson.error?.message || `cloudinary_http_${uploadRes.status}`,
+      };
+    };
+
+    try {
+      const videoAttempt = await attemptCloudinary('video');
+      if (videoAttempt.ok) {
+        res.json({ ok: true, url: videoAttempt.url });
         return;
       }
-
-      const playableUrl = uploadJson.secure_url
-        .replace('/video/upload/', '/video/upload/f_mp3,br_24k/')
-        .replace(/\.[a-z0-9]+$/i, '.mp3');
-
-      res.json({ ok: true, url: playableUrl });
+      if (videoAttempt.status === 400) {
+        const rawAttempt = await attemptCloudinary('raw');
+        if (rawAttempt.ok) {
+          res.json({ ok: true, url: rawAttempt.url });
+          return;
+        }
+      }
+      res.status(502).json({ ok: false, error: videoAttempt.error });
     } catch {
       res.status(502).json({ ok: false, error: 'voice_upload_unavailable' });
     }

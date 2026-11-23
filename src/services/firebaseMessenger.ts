@@ -25,6 +25,7 @@ import {
   deleteField,
   doc,
   getDoc,
+  limitToLast,
   onSnapshot,
   orderBy,
   query,
@@ -480,7 +481,8 @@ export function subscribeToFirebaseChats(
           if (messageUnsubs.has(chatId)) return;
           const msgsQuery = query(
             collection(db!, 'chats', chatId, 'messages'),
-            orderBy('createdAt', 'asc')
+            orderBy('createdAt', 'asc'),
+            limitToLast(150)
           );
 
           const unsubMsgs = onSnapshot(
@@ -956,63 +958,220 @@ export async function sendFirebaseTypingStatus(
   }
 }
 
+async function postAuthorizedJson(
+  url: string,
+  payload: Record<string, unknown>
+): Promise<{ res: Response; data: Record<string, unknown> }> {
+  let user = auth?.currentUser ?? null;
+  if (!user) {
+    const signedIn = await ensureFirebaseSignedIn();
+    user = signedIn.user;
+  }
+
+  const sendOnce = async (forceRefresh: boolean) => {
+    const idToken = await user?.getIdToken(forceRefresh);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+      },
+      body: JSON.stringify(payload),
+    });
+    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    return { res, data };
+  };
+
+  let attempt = await sendOnce(false);
+  if (attempt.res.status === 401 && user) {
+    attempt = await sendOnce(true);
+  }
+  return attempt;
+}
+
 export async function uploadCompressedChatImage(
   imageBase64: string,
   name?: string
 ): Promise<string> {
-  let user = auth?.currentUser ?? null;
-  if (!user) {
-    const signedIn = await ensureFirebaseSignedIn();
-    user = signedIn.user;
-  }
-  const idToken = await user?.getIdToken();
-  const res = await fetch('/api/upload-image', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
-    },
-    body: JSON.stringify({ imageBase64, name }),
+  const { res, data } = await postAuthorizedJson('/api/upload-image', {
+    imageBase64,
+    name,
   });
 
-  const data = (await res.json().catch(() => ({}))) as {
-    ok?: boolean;
-    url?: string;
-    error?: string;
-  };
-  if (!res.ok || !data.ok || !data.url) {
-    throw new Error(data.error || `image_upload_http_${res.status}`);
+  if (!res.ok || data.ok !== true || typeof data.url !== 'string' || !data.url) {
+    const errStr =
+      typeof data.error === 'string' && data.error
+        ? data.error
+        : `image_upload_http_${res.status}`;
+    throw new Error(errStr);
   }
   return data.url;
 }
 
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : '';
+      const commaIdx = result.indexOf(',');
+      if (commaIdx === -1) {
+        reject(new Error('invalid_audio_read'));
+        return;
+      }
+      resolve(result.slice(commaIdx + 1));
+    };
+    reader.onerror = () => reject(new Error('audio_read_failed'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function getAudioFilename(mimeType: string, name?: string): string {
+  const clean = (name || `voice_${Date.now()}`).replace(/[^a-zA-Z0-9_-]/g, '');
+  const lower = mimeType.toLowerCase();
+  const ext = lower.includes('mp4') || lower.includes('aac')
+    ? 'm4a'
+    : lower.includes('ogg')
+    ? 'ogg'
+    : lower.includes('mpeg') || lower.includes('mp3')
+    ? 'mp3'
+    : 'webm';
+  return `${clean}.${ext}`;
+}
+
 export async function uploadCompressedChatVoice(
-  audioBase64: string,
+  audioInput: Blob | string,
   mimeType: string,
   name?: string
 ): Promise<string> {
-  let user = auth?.currentUser ?? null;
-  if (!user) {
-    const signedIn = await ensureFirebaseSignedIn();
-    user = signedIn.user;
+  if (typeof audioInput === 'string') {
+    const { res, data } = await postAuthorizedJson('/api/upload-voice', {
+      audioBase64: audioInput,
+      mimeType,
+      name,
+    });
+    if (!res.ok || data.ok !== true || typeof data.url !== 'string' || !data.url) {
+      const errStr =
+        typeof data.error === 'string' && data.error
+          ? data.error
+          : `voice_upload_http_${res.status}`;
+      throw new Error(errStr);
+    }
+    return data.url;
   }
-  const idToken = await user?.getIdToken();
-  const res = await fetch('/api/upload-voice', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
-    },
-    body: JSON.stringify({ audioBase64, mimeType, name }),
-  });
 
-  const data = (await res.json().catch(() => ({}))) as {
-    ok?: boolean;
-    url?: string;
-    error?: string;
+  // Step 1: Request short-lived Cloudinary signature from backend
+  const { res: signRes, data: signData } = await postAuthorizedJson(
+    '/api/upload-voice',
+    { mode: 'sign' }
+  );
+  if (!signRes.ok || signData.ok !== true) {
+    const errStr =
+      typeof signData.error === 'string' && signData.error
+        ? signData.error
+        : `voice_sign_http_${signRes.status}`;
+    throw new Error(errStr);
+  }
+
+  const cloudName =
+    typeof signData.cloudName === 'string' ? signData.cloudName : '';
+  const apiKey = typeof signData.apiKey === 'string' ? signData.apiKey : '';
+  const timestamp = signData.timestamp;
+  const folder = typeof signData.folder === 'string' ? signData.folder : '';
+  const signature =
+    typeof signData.signature === 'string' ? signData.signature : '';
+
+  if (!cloudName || !apiKey || !timestamp || !folder || !signature) {
+    throw new Error('missing_cloudinary_config');
+  }
+
+  const filename = getAudioFilename(mimeType, name);
+
+  const directUpload = async (resourceType: 'video' | 'raw') => {
+    const form = new FormData();
+    form.append('file', audioInput, filename);
+    form.append('api_key', apiKey);
+    form.append('timestamp', String(timestamp));
+    form.append('folder', folder);
+    form.append('signature', signature);
+
+    const upRes = await fetch(
+      `https://api.cloudinary.com/v1_1/${encodeURIComponent(
+        cloudName
+      )}/${resourceType}/upload`,
+      { method: 'POST', body: form }
+    );
+    const upJson = (await upRes.json().catch(() => ({}))) as {
+      secure_url?: string;
+      error?: { message?: string };
+    };
+    return { upRes, upJson };
   };
-  if (!res.ok || !data.ok || !data.url) {
-    throw new Error(data.error || `voice_upload_http_${res.status}`);
+
+  try {
+    const first = await directUpload('video');
+    if (first.upRes.ok && first.upJson.secure_url) {
+      return first.upJson.secure_url
+        .replace('/video/upload/', '/video/upload/f_mp3,br_24k/')
+        .replace(/\.[a-z0-9]+$/i, '.mp3');
+    }
+
+    const firstMsg = first.upJson?.error?.message || '';
+    // Only retry as raw if Cloudinary rejected container/codec format (400)
+    if (
+      first.upRes.status === 400 &&
+      !/signature|api_key|api key|cloud_name|timestamp/i.test(firstMsg)
+    ) {
+      const rawAttempt = await directUpload('raw');
+      if (rawAttempt.upRes.ok && rawAttempt.upJson.secure_url) {
+        return rawAttempt.upJson.secure_url;
+      }
+    }
+
+    if (firstMsg) {
+      throw new Error(firstMsg);
+    }
+  } catch (directErr) {
+    // Re-throw explicit Cloudinary credential/signature errors directly
+    if (
+      directErr instanceof Error &&
+      /signature|api_key|api key|cloud_name|timestamp|unknown/i.test(
+        directErr.message
+      )
+    ) {
+      throw directErr;
+    }
+    // Otherwise fall back to server-proxied base64 upload
+    const base64 = await blobToBase64(audioInput);
+    const { res, data } = await postAuthorizedJson('/api/upload-voice', {
+      audioBase64: base64,
+      mimeType,
+      name,
+    });
+    if (!res.ok || data.ok !== true || typeof data.url !== 'string' || !data.url) {
+      const errStr =
+        typeof data.error === 'string' && data.error
+          ? data.error
+          : directErr instanceof Error && directErr.message
+          ? directErr.message
+          : `voice_upload_http_${res.status}`;
+      throw new Error(errStr);
+    }
+    return data.url;
+  }
+
+  // Fallback if direct upload returned non-ok without error message
+  const base64 = await blobToBase64(audioInput);
+  const { res, data } = await postAuthorizedJson('/api/upload-voice', {
+    audioBase64: base64,
+    mimeType,
+    name,
+  });
+  if (!res.ok || data.ok !== true || typeof data.url !== 'string' || !data.url) {
+    const errStr =
+      typeof data.error === 'string' && data.error
+        ? data.error
+        : `voice_upload_http_${res.status}`;
+    throw new Error(errStr);
   }
   return data.url;
 }
@@ -1096,10 +1255,10 @@ export async function sendFirebaseDirectMessage(params: {
   }
 
   const dispatchPushReminder = async () => {
-    try {
-      const idToken = await auth?.currentUser?.getIdToken();
-      if (!idToken) return;
-      await fetch('/api/push/reminder', {
+    const sendOnce = async (forceRefresh: boolean): Promise<Response | null> => {
+      const idToken = await auth?.currentUser?.getIdToken(forceRefresh);
+      if (!idToken) return null;
+      return fetch('/api/push/reminder', {
         method: 'POST',
         keepalive: true,
         headers: {
@@ -1108,8 +1267,23 @@ export async function sendFirebaseDirectMessage(params: {
         },
         body: JSON.stringify({ toUserId: peerUid, messageId }),
       });
+    };
+
+    try {
+      let res = await sendOnce(false);
+      if (res && res.status === 401) {
+        res = await sendOnce(true);
+      } else if (!res || res.status >= 500) {
+        await new Promise((r) => setTimeout(r, 300));
+        await sendOnce(false);
+      }
     } catch {
-      // Non-blocking: foreground/realtime listeners still deliver messages
+      try {
+        await new Promise((r) => setTimeout(r, 300));
+        await sendOnce(false);
+      } catch {
+        // Non-blocking: foreground/realtime listeners still deliver messages
+      }
     }
   };
 
@@ -1256,6 +1430,23 @@ export async function deleteFirebaseDirectMessage(
   }
 }
 
+function getOrCreatePushDeviceId(): string {
+  const storageKey = 'notepad_push_device_id_v1';
+  try {
+    const existing = localStorage.getItem(storageKey);
+    if (existing && /^[A-Za-z0-9_-]{6,64}$/.test(existing)) {
+      return existing;
+    }
+    const created = `dev_${Date.now().toString(36)}_${Math.random()
+      .toString(36)
+      .slice(2, 10)}`;
+    localStorage.setItem(storageKey, created);
+    return created;
+  } catch {
+    return 'dev_default';
+  }
+}
+
 export async function registerFirebasePushNotifications(
   uid: string
 ): Promise<{ ok: boolean; token?: string; reason?: string }> {
@@ -1355,6 +1546,15 @@ export async function registerFirebasePushNotifications(
         vapidKey: VAPID_KEY,
         serviceWorkerRegistration: swReg,
       });
+      if (token && swReg?.pushManager) {
+        const activeSub = await swReg.pushManager.getSubscription().catch(() => null);
+        if (!activeSub) {
+          token = await getToken(messaging, {
+            vapidKey: VAPID_KEY,
+            serviceWorkerRegistration: swReg,
+          });
+        }
+      }
     } catch (firstErr) {
       // Recover from stale PushSubscription or corrupted VAPID subscription
       if (swReg?.pushManager) {
@@ -1376,9 +1576,15 @@ export async function registerFirebasePushNotifications(
     }
 
     if (token && db) {
+      const deviceId = getOrCreatePushDeviceId();
       await setDoc(
         doc(db, 'users', uid),
-        { fcmToken: token, updatedAt: Date.now() },
+        {
+          fcmToken: token,
+          fcmTokens: { [deviceId]: token },
+          fcmUpdatedAt: Date.now(),
+          updatedAt: Date.now(),
+        },
         { merge: true }
       );
       return { ok: true, token };

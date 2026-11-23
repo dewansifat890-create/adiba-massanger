@@ -36,6 +36,11 @@ interface SWMessageEvent extends SWExtendableEvent {
   data?: unknown;
 }
 
+interface SWNotificationOptions extends NotificationOptions {
+  renotify?: boolean;
+  vibrate?: number[];
+}
+
 interface SWGlobalScope {
   __WB_MANIFEST: Array<PrecacheEntry | string>;
   navigator?: { userAgent?: string };
@@ -204,14 +209,17 @@ self.addEventListener('push', (event: SWPushEvent) => {
         const notifTag = messageId
           ? `notepad-msg-${messageId}`
           : `notepad-reminder-${Date.now()}`;
-        return self.registration.showNotification(title, {
+        const notifOptions: SWNotificationOptions = {
           body,
           icon: '/pwa-192x192.png',
           badge: '/pwa-192x192.png',
           tag: notifTag,
+          renotify: true,
           silent: isMuted,
+          ...(isMuted ? {} : { vibrate: [160, 80, 160] }),
           data: { url, fromUserId, messageId },
-        });
+        };
+        return self.registration.showNotification(title, notifOptions);
       }
       return undefined;
     })

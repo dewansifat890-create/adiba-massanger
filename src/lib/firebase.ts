@@ -2,7 +2,15 @@ import { FirebaseApp, getApp, getApps, initializeApp } from 'firebase/app';
 import { getAnalytics, isSupported as isAnalyticsSupported } from 'firebase/analytics';
 import { Auth, getAuth } from 'firebase/auth';
 import { Database, getDatabase } from 'firebase/database';
-import { doc, Firestore, getDocFromServer, getFirestore } from 'firebase/firestore';
+import {
+  doc,
+  Firestore,
+  getDocFromServer,
+  getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+} from 'firebase/firestore';
 import {
   getMessaging,
   isSupported as isMessagingSupported,
@@ -52,7 +60,15 @@ let cachedRtdb: Database | null = null;
 if (isFirebaseConfigured()) {
   cachedApp = getApps().length ? getApp() : initializeApp(firebaseConfig);
   cachedAuth = getAuth(cachedApp);
-  cachedDb = getFirestore(cachedApp);
+  try {
+    cachedDb = initializeFirestore(cachedApp, {
+      localCache: persistentLocalCache({
+        tabManager: persistentMultipleTabManager(),
+      }),
+    });
+  } catch {
+    cachedDb = getFirestore(cachedApp);
+  }
   if (firebaseConfig.databaseURL) {
     try {
       cachedRtdb = getDatabase(cachedApp);

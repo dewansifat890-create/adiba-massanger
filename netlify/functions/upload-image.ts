@@ -1,14 +1,8 @@
-import { createHash, createVerify } from 'node:crypto';
+import { createVerify } from 'node:crypto';
 
 interface CachedCerts {
   certs: Record<string, string>;
   expiresAt: number;
-}
-
-interface CloudinaryCreds {
-  cloudName: string;
-  apiKey: string;
-  apiSecret: string;
 }
 
 const GOOGLE_CERTS_URL =
@@ -106,25 +100,8 @@ async function verifyFirebaseIdToken(
   return payload.sub;
 }
 
-function getCloudinaryCreds(): CloudinaryCreds | null {
-  const rawUrl = process.env.CLOUDINARY_URL?.trim();
-  if (rawUrl) {
-    const match = rawUrl.match(/^cloudinary:\/\/([^:]+):([^@]+)@([^/\s]+)$/i);
-    if (match) {
-      return {
-        apiKey: decodeURIComponent(match[1]),
-        apiSecret: decodeURIComponent(match[2]),
-        cloudName: decodeURIComponent(match[3]),
-      };
-    }
-  }
-  const cloudName = process.env.CLOUDINARY_CLOUD_NAME?.trim() || '';
-  const apiKey = process.env.CLOUDINARY_API_KEY?.trim() || '';
-  const apiSecret = process.env.CLOUDINARY_API_SECRET?.trim() || '';
-  if (cloudName && apiKey && apiSecret) {
-    return { cloudName, apiKey, apiSecret };
-  }
-  return null;
+function cleanEnvValue(raw?: string): string {
+  return (raw || '').trim().replace(/^['"]+|['"]+$/g, '').trim();
 }
 
 async function uploadToImgbb(
@@ -146,7 +123,7 @@ async function uploadToImgbb(
   form.append('name', cleanName);
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
+  const timer = setTimeout(() => controller.abort(), 9_000);
   try {
     const uploadRes = await fetch(IMGBB_UPLOAD_URL, {
       method: 'POST',
@@ -184,61 +161,6 @@ async function uploadToImgbb(
   }
 }
 
-async function uploadImageToCloudinary(
-  creds: CloudinaryCreds,
-  cleanBase64: string,
-  mimeType: string,
-  cleanName: string
-): Promise<{ ok: true; url: string; thumbUrl: string } | { ok: false; error: string }> {
-  const timestamp = Math.floor(Date.now() / 1000);
-  const folder = 'notepad_images';
-  const toSign = `folder=${folder}&timestamp=${timestamp}${creds.apiSecret}`;
-  const signature = createHash('sha1').update(toSign).digest('hex');
-
-  const binary = Buffer.from(cleanBase64, 'base64');
-  const form = new FormData();
-  form.append('file', new Blob([binary], { type: mimeType }), `${cleanName}.jpg`);
-  form.append('api_key', creds.apiKey);
-  form.append('timestamp', String(timestamp));
-  form.append('folder', folder);
-  form.append('signature', signature);
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
-  try {
-    const res = await fetch(
-      `https://api.cloudinary.com/v1_1/${encodeURIComponent(creds.cloudName)}/image/upload`,
-      {
-        method: 'POST',
-        body: form,
-        signal: controller.signal,
-      }
-    );
-    const json = (await res.json().catch(() => ({}))) as {
-      secure_url?: string;
-      error?: { message?: string };
-    };
-    if (res.ok && json.secure_url) {
-      return {
-        ok: true,
-        url: json.secure_url,
-        thumbUrl: json.secure_url,
-      };
-    }
-    return {
-      ok: false,
-      error: json.error?.message || `cloudinary_http_${res.status}`,
-    };
-  } catch (err: unknown) {
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : 'cloudinary_network_error',
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 export default async (req: Request): Promise<Response> => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -247,10 +169,8 @@ export default async (req: Request): Promise<Response> => {
     return jsonResponse({ ok: false, error: 'Method not allowed' }, 405);
   }
 
-  const imgbbKey = process.env.IMGBB_API_KEY?.trim() || '';
-  const cloudinaryCreds = getCloudinaryCreds();
-
-  if (!imgbbKey && !cloudinaryCreds) {
+  const imgbbKey = cleanEnvValue(process.env.IMGBB_API_KEY);
+  if (!imgbbKey) {
     return jsonResponse({ ok: false, error: 'missing_imgbb_api_key' }, 503);
   }
 
@@ -296,41 +216,19 @@ export default async (req: Request): Promise<Response> => {
       ? body.name.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48)
       : `img_${Date.now()}`;
 
-  let lastError = 'upload_unavailable';
-
-  if (imgbbKey) {
-    const imgbbResult = await uploadToImgbb(
-      imgbbKey,
-      cleanBase64,
-      mimeType,
-      cleanName
-    );
-    if (imgbbResult.ok) {
-      return jsonResponse({
-        ok: true,
-        url: imgbbResult.url,
-        thumbUrl: imgbbResult.thumbUrl,
-      });
-    }
-    lastError = imgbbResult.error;
+  const imgbbResult = await uploadToImgbb(
+    imgbbKey,
+    cleanBase64,
+    mimeType,
+    cleanName
+  );
+  if (imgbbResult.ok) {
+    return jsonResponse({
+      ok: true,
+      url: imgbbResult.url,
+      thumbUrl: imgbbResult.thumbUrl,
+    });
   }
 
-  if (cloudinaryCreds) {
-    const cloudResult = await uploadImageToCloudinary(
-      cloudinaryCreds,
-      cleanBase64,
-      mimeType,
-      cleanName
-    );
-    if (cloudResult.ok) {
-      return jsonResponse({
-        ok: true,
-        url: cloudResult.url,
-        thumbUrl: cloudResult.thumbUrl,
-      });
-    }
-    lastError = cloudResult.error;
-  }
-
-  return jsonResponse({ ok: false, error: lastError }, 502);
+  return jsonResponse({ ok: false, error: imgbbResult.error }, 502);
 };

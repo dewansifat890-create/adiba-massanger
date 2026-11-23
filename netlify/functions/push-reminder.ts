@@ -35,7 +35,6 @@ const WARM_TTL_MS = 45_000;
 let cachedAccessToken: CachedAccessToken | null = null;
 let cachedCerts: CachedCerts | null = null;
 const chatAuthCache = new Map<string, CachedEntry<boolean>>();
-const fcmTokenCache = new Map<string, CachedEntry<string>>();
 
 function makeDmId(userA: string, userB: string): string {
   return [userA, userB].sort().join('__');
@@ -291,17 +290,19 @@ async function getGoogleAccessToken(sa: ServiceAccountCreds): Promise<string> {
   return tokenJson.access_token;
 }
 
+interface FirestoreValue {
+  stringValue?: string;
+  nullValue?: null;
+  arrayValue?: {
+    values?: Array<{ stringValue?: string }>;
+  };
+  mapValue?: {
+    fields?: Record<string, FirestoreValue>;
+  };
+}
+
 interface FirestoreDocResponse {
-  fields?: Record<
-    string,
-    {
-      stringValue?: string;
-      nullValue?: null;
-      arrayValue?: {
-        values?: Array<{ stringValue?: string }>;
-      };
-    }
-  >;
+  fields?: Record<string, FirestoreValue>;
 }
 
 async function getFirestoreDoc(
@@ -326,17 +327,44 @@ async function getFirestoreDoc(
   return (await res.json()) as FirestoreDocResponse;
 }
 
-async function clearUserFcmToken(
+interface DeadTokenCleanup {
+  clearLegacySingle: boolean;
+  deadDeviceKeys: string[];
+}
+
+async function clearDeadFcmTokens(
   projectId: string,
   accessToken: string,
-  userId: string
+  userId: string,
+  cleanup: DeadTokenCleanup
 ): Promise<void> {
-  fcmTokenCache.delete(userId);
+  const maskParams: string[] = [];
+  const fields: Record<string, FirestoreValue> = {};
+
+  if (cleanup.clearLegacySingle) {
+    maskParams.push('updateMask.fieldPaths=fcmToken');
+    fields.fcmToken = { nullValue: null };
+  }
+
+  const safeKeys = cleanup.deadDeviceKeys.filter((k) =>
+    /^[A-Za-z0-9_-]{1,64}$/.test(k)
+  );
+  if (safeKeys.length > 0) {
+    const mapFields: Record<string, FirestoreValue> = {};
+    for (const k of safeKeys) {
+      maskParams.push(`updateMask.fieldPaths=${encodeURIComponent(`fcmTokens.${k}`)}`);
+      mapFields[k] = { nullValue: null };
+    }
+    fields.fcmTokens = { mapValue: { fields: mapFields } };
+  }
+
+  if (maskParams.length === 0) return;
+
   const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
     projectId
   )}/databases/(default)/documents/users/${encodeURIComponent(
     userId
-  )}?updateMask.fieldPaths=fcmToken`;
+  )}?${maskParams.join('&')}`;
 
   await fetch(url, {
     method: 'PATCH',
@@ -344,15 +372,17 @@ async function clearUserFcmToken(
       Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      fields: {
-        fcmToken: { nullValue: null },
-      },
-    }),
+    body: JSON.stringify({ fields }),
   });
 }
 
-async function resolveChatAndToken(
+interface ResolvedTokenTarget {
+  token: string;
+  deviceKeys: string[];
+  matchesLegacy: boolean;
+}
+
+async function resolveChatAndTokens(
   projectId: string,
   accessToken: string,
   callerUid: string,
@@ -360,31 +390,19 @@ async function resolveChatAndToken(
 ): Promise<{
   allowed: boolean;
   notFound?: boolean;
-  fcmToken?: string;
+  tokens: ResolvedTokenTarget[];
 }> {
   const now = Date.now();
   const chatId = makeDmId(callerUid, toUserId);
   const authKey = `${callerUid}:${chatId}`;
   const cachedAllowed = chatAuthCache.get(authKey);
-  const cachedToken = fcmTokenCache.get(toUserId);
-
   const hasWarmAuth = Boolean(cachedAllowed && cachedAllowed.expiresAt > now);
-  const hasWarmToken = Boolean(cachedToken && cachedToken.expiresAt > now);
-
-  if (hasWarmAuth && hasWarmToken) {
-    return {
-      allowed: Boolean(cachedAllowed!.value),
-      fcmToken: cachedToken!.value,
-    };
-  }
 
   let [chatDoc, recipientDoc] = await Promise.all([
     hasWarmAuth
       ? Promise.resolve(null)
       : getFirestoreDoc(projectId, accessToken, `chats/${encodeURIComponent(chatId)}`),
-    hasWarmToken
-      ? Promise.resolve(null)
-      : getFirestoreDoc(projectId, accessToken, `users/${encodeURIComponent(toUserId)}`),
+    getFirestoreDoc(projectId, accessToken, `users/${encodeURIComponent(toUserId)}`),
   ]);
 
   if (!hasWarmAuth && !chatDoc) {
@@ -400,7 +418,7 @@ async function resolveChatAndToken(
   let allowed = hasWarmAuth ? Boolean(cachedAllowed!.value) : false;
   if (!hasWarmAuth) {
     if (!chatDoc) {
-      return { allowed: false, notFound: true };
+      return { allowed: false, notFound: true, tokens: [] };
     }
     const participantValues =
       chatDoc.fields?.participants?.arrayValue?.values || [];
@@ -414,19 +432,43 @@ async function resolveChatAndToken(
   }
 
   if (!allowed) {
-    return { allowed: false };
+    return { allowed: false, tokens: [] };
   }
 
-  let fcmToken = hasWarmToken ? cachedToken!.value : undefined;
-  if (!hasWarmToken) {
-    const rawToken = recipientDoc?.fields?.fcmToken?.stringValue;
-    if (typeof rawToken === 'string' && rawToken) {
-      fcmToken = rawToken;
-      fcmTokenCache.set(toUserId, { value: rawToken, expiresAt: now + WARM_TTL_MS });
+  const targetMap = new Map<string, ResolvedTokenTarget>();
+  const mapFields = recipientDoc?.fields?.fcmTokens?.mapValue?.fields;
+  if (mapFields && typeof mapFields === 'object') {
+    for (const [deviceKey, val] of Object.entries(mapFields)) {
+      const tok = typeof val?.stringValue === 'string' ? val.stringValue.trim() : '';
+      if (!tok) continue;
+      const existing = targetMap.get(tok);
+      if (existing) {
+        existing.deviceKeys.push(deviceKey);
+      } else {
+        targetMap.set(tok, {
+          token: tok,
+          deviceKeys: [deviceKey],
+          matchesLegacy: false,
+        });
+      }
     }
   }
 
-  return { allowed: true, fcmToken };
+  const legacyToken = recipientDoc?.fields?.fcmToken?.stringValue?.trim();
+  if (legacyToken) {
+    const existing = targetMap.get(legacyToken);
+    if (existing) {
+      existing.matchesLegacy = true;
+    } else {
+      targetMap.set(legacyToken, {
+        token: legacyToken,
+        deviceKeys: [],
+        matchesLegacy: true,
+      });
+    }
+  }
+
+  return { allowed: true, tokens: Array.from(targetMap.values()) };
 }
 
 export default async (req: Request): Promise<Response> => {
@@ -483,7 +525,7 @@ export default async (req: Request): Promise<Response> => {
   // Handle pre-warm ping while user opens chat / types so Send fires with 0 cold start
   if (bodyData?.warmup === true) {
     if (/^[A-Za-z0-9_-]{4,128}$/.test(toUserId) && toUserId !== callerUid) {
-      await resolveChatAndToken(sa.projectId, accessToken, callerUid, toUserId).catch(
+      await resolveChatAndTokens(sa.projectId, accessToken, callerUid, toUserId).catch(
         () => {}
       );
     }
@@ -499,7 +541,7 @@ export default async (req: Request): Promise<Response> => {
   const cleanMsgId = /^[A-Za-z0-9_-]{4,128}$/.test(rawMsgId) ? rawMsgId : '';
 
   try {
-    const resolved = await resolveChatAndToken(
+    const resolved = await resolveChatAndTokens(
       sa.projectId,
       accessToken,
       callerUid,
@@ -515,7 +557,7 @@ export default async (req: Request): Promise<Response> => {
       );
     }
 
-    if (!resolved.fcmToken) {
+    if (resolved.tokens.length === 0) {
       return jsonResponse({ ok: true, pushed: false, reason: 'no_fcm_token' });
     }
 
@@ -526,89 +568,119 @@ export default async (req: Request): Promise<Response> => {
       sa.projectId
     )}/messages:send`;
 
-    const fcmRes = await fetch(fcmUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        message: {
-          token: resolved.fcmToken,
-          notification: {
-            title: 'NotePad',
-            body: 'You have a new note reminder',
+    const sendResults = await Promise.all(
+      resolved.tokens.map(async (target) => {
+        const fcmRes = await fetch(fcmUrl, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
           },
-          data: {
-            title: 'NotePad',
-            body: 'You have a new note reminder',
-            url: '/',
-            fromUserId: callerUid,
-            ...(cleanMsgId ? { messageId: cleanMsgId } : {}),
-          },
-          android: {
-            priority: 'HIGH',
-            ttl: '86400s',
-            notification: {
-              title: 'NotePad',
-              body: 'You have a new note reminder',
-              sound: 'default',
-              default_sound: true,
-              notification_priority: 'PRIORITY_HIGH',
-              visibility: 'PUBLIC',
-              tag: tagId,
+          body: JSON.stringify({
+            message: {
+              token: target.token,
+              notification: {
+                title: 'NotePad',
+                body: 'You have a new note reminder',
+              },
+              data: {
+                title: 'NotePad',
+                body: 'You have a new note reminder',
+                url: '/',
+                fromUserId: callerUid,
+                ...(cleanMsgId ? { messageId: cleanMsgId } : {}),
+              },
+              android: {
+                priority: 'HIGH',
+                ttl: '86400s',
+                notification: {
+                  title: 'NotePad',
+                  body: 'You have a new note reminder',
+                  sound: 'default',
+                  default_sound: true,
+                  notification_priority: 'PRIORITY_HIGH',
+                  visibility: 'PUBLIC',
+                  tag: tagId,
+                },
+              },
+              webpush: {
+                headers: {
+                  Urgency: 'high',
+                  TTL: '86400',
+                },
+                notification: {
+                  title: 'NotePad',
+                  body: 'You have a new note reminder',
+                  icon: '/pwa-192x192.png',
+                  badge: '/pwa-192x192.png',
+                  tag: tagId,
+                  renotify: true,
+                },
+                fcm_options: {
+                  link: '/',
+                },
+              },
             },
-          },
-          webpush: {
-            headers: {
-              Urgency: 'high',
-              TTL: '86400',
-            },
-            notification: {
-              title: 'NotePad',
-              body: 'You have a new note reminder',
-              icon: '/pwa-192x192.png',
-              badge: '/pwa-192x192.png',
-              tag: tagId,
-              renotify: false,
-            },
-            fcm_options: {
-              link: '/',
-            },
-          },
-        },
-      }),
-    });
+          }),
+        });
 
-    if (fcmRes.ok) {
-      return jsonResponse({ ok: true, pushed: true });
+        if (fcmRes.ok) {
+          return { ok: true as const, target };
+        }
+
+        const errJson = (await fcmRes.json().catch(() => ({}))) as {
+          error?: {
+            status?: string;
+            message?: string;
+            details?: Array<{ errorCode?: string }>;
+          };
+        };
+        const fcmErrorCode =
+          errJson.error?.details?.find((d) => d.errorCode)?.errorCode ||
+          errJson.error?.status ||
+          `fcm_http_${fcmRes.status}`;
+
+        const isInvalidToken =
+          fcmErrorCode === 'UNREGISTERED' ||
+          (fcmErrorCode === 'INVALID_ARGUMENT' &&
+            (errJson.error?.message || '')
+              .toLowerCase()
+              .includes('registration token'));
+
+        return { ok: false as const, target, fcmErrorCode, isInvalidToken };
+      })
+    );
+
+    const deadDeviceKeys: string[] = [];
+    let clearLegacySingle = false;
+    let sentCount = 0;
+    let lastErrorCode = '';
+
+    for (const r of sendResults) {
+      if (r.ok) {
+        sentCount += 1;
+      } else {
+        lastErrorCode = r.fcmErrorCode;
+        if (r.isInvalidToken) {
+          if (r.target.matchesLegacy) clearLegacySingle = true;
+          deadDeviceKeys.push(...r.target.deviceKeys);
+        }
+      }
     }
 
-    const errJson = (await fcmRes.json().catch(() => ({}))) as {
-      error?: {
-        status?: string;
-        message?: string;
-        details?: Array<{ errorCode?: string }>;
-      };
-    };
-    const fcmErrorCode =
-      errJson.error?.details?.find((d) => d.errorCode)?.errorCode ||
-      errJson.error?.status ||
-      `fcm_http_${fcmRes.status}`;
-
-    const isInvalidToken =
-      fcmErrorCode === 'UNREGISTERED' ||
-      (fcmErrorCode === 'INVALID_ARGUMENT' &&
-        (errJson.error?.message || '').toLowerCase().includes('registration token'));
-
-    if (isInvalidToken) {
-      await clearUserFcmToken(sa.projectId, accessToken, toUserId).catch(
-        () => {}
-      );
+    if (clearLegacySingle || deadDeviceKeys.length > 0) {
+      await clearDeadFcmTokens(sa.projectId, accessToken, toUserId, {
+        clearLegacySingle,
+        deadDeviceKeys,
+      }).catch(() => {});
     }
 
-    console.warn('Netlify FCM reminder send skipped:', fcmErrorCode);
-    return jsonResponse({ ok: true, pushed: false, reason: fcmErrorCode });
+    if (sentCount > 0) {
+      return jsonResponse({ ok: true, pushed: true, sentCount });
+    }
+
+    console.warn('Netlify FCM reminder send skipped:', lastErrorCode);
+    return jsonResponse({ ok: true, pushed: false, reason: lastErrorCode });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'push_unavailable';
     console.warn('Netlify push-reminder error:', message);

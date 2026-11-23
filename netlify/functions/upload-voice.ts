@@ -13,6 +13,7 @@ interface CloudinaryCreds {
 
 const GOOGLE_CERTS_URL =
   'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com';
+const VOICE_FOLDER = 'notepad_voice';
 
 let cachedCerts: CachedCerts | null = null;
 
@@ -105,25 +106,92 @@ async function verifyFirebaseIdToken(
   return payload.sub;
 }
 
+function cleanEnvValue(raw?: string): string {
+  return (raw || '').trim().replace(/^['"]+|['"]+$/g, '').trim();
+}
+
 function getCloudinaryCreds(): CloudinaryCreds | null {
-  const rawUrl = process.env.CLOUDINARY_URL?.trim();
+  let rawUrl = cleanEnvValue(process.env.CLOUDINARY_URL);
+  if (rawUrl.toUpperCase().startsWith('CLOUDINARY_URL=')) {
+    rawUrl = rawUrl.slice('CLOUDINARY_URL='.length).trim();
+  }
   if (rawUrl) {
-    const match = rawUrl.match(/^cloudinary:\/\/([^:]+):([^@]+)@([^/\s]+)$/i);
+    const match = rawUrl.match(/^cloudinary:\/\/([^:]+):([^@]+)@([^/\s?#]+)$/i);
     if (match) {
       return {
-        apiKey: decodeURIComponent(match[1]),
-        apiSecret: decodeURIComponent(match[2]),
-        cloudName: decodeURIComponent(match[3]),
+        apiKey: decodeURIComponent(match[1]).trim(),
+        apiSecret: decodeURIComponent(match[2]).trim(),
+        cloudName: decodeURIComponent(match[3]).trim(),
       };
     }
   }
-  const cloudName = process.env.CLOUDINARY_CLOUD_NAME?.trim() || '';
-  const apiKey = process.env.CLOUDINARY_API_KEY?.trim() || '';
-  const apiSecret = process.env.CLOUDINARY_API_SECRET?.trim() || '';
+  const cloudName = cleanEnvValue(process.env.CLOUDINARY_CLOUD_NAME);
+  const apiKey = cleanEnvValue(process.env.CLOUDINARY_API_KEY);
+  const apiSecret = cleanEnvValue(process.env.CLOUDINARY_API_SECRET);
   if (cloudName && apiKey && apiSecret) {
     return { cloudName, apiKey, apiSecret };
   }
   return null;
+}
+
+function signCloudinaryFolderUpload(creds: CloudinaryCreds) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const toSign = `folder=${VOICE_FOLDER}&timestamp=${timestamp}${creds.apiSecret}`;
+  const signature = createHash('sha1').update(toSign).digest('hex');
+  return { timestamp, signature, folder: VOICE_FOLDER };
+}
+
+async function uploadAudioToCloudinary(
+  creds: CloudinaryCreds,
+  resourceType: 'video' | 'raw',
+  dataUri: string
+): Promise<{ ok: true; url: string } | { ok: false; status: number; error: string }> {
+  const { timestamp, signature, folder } = signCloudinaryFolderUpload(creds);
+  const form = new FormData();
+  form.append('file', dataUri);
+  form.append('api_key', creds.apiKey);
+  form.append('timestamp', String(timestamp));
+  form.append('folder', folder);
+  form.append('signature', signature);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 9_000);
+  try {
+    const uploadRes = await fetch(
+      `https://api.cloudinary.com/v1_1/${encodeURIComponent(creds.cloudName)}/${resourceType}/upload`,
+      {
+        method: 'POST',
+        body: form,
+        signal: controller.signal,
+      }
+    );
+    const uploadJson = (await uploadRes.json().catch(() => ({}))) as {
+      secure_url?: string;
+      error?: { message?: string };
+    };
+    if (uploadRes.ok && uploadJson.secure_url) {
+      const playableUrl =
+        resourceType === 'video'
+          ? uploadJson.secure_url
+              .replace('/video/upload/', '/video/upload/f_mp3,br_24k/')
+              .replace(/\.[a-z0-9]+$/i, '.mp3')
+          : uploadJson.secure_url;
+      return { ok: true, url: playableUrl };
+    }
+    return {
+      ok: false,
+      status: uploadRes.status,
+      error: uploadJson.error?.message || `cloudinary_http_${uploadRes.status}`,
+    };
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      status: 502,
+      error: err instanceof Error ? err.message : 'voice_upload_unavailable',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export default async (req: Request): Promise<Response> => {
@@ -159,15 +227,32 @@ export default async (req: Request): Promise<Response> => {
     return jsonResponse({ ok: false, error: 'Invalid auth token' }, 401);
   }
 
-  let body: { audioBase64?: unknown; mimeType?: unknown; name?: unknown } = {};
+  let body: {
+    mode?: unknown;
+    audioBase64?: unknown;
+    mimeType?: unknown;
+  } = {};
   try {
     body = (await req.json()) as {
+      mode?: unknown;
       audioBase64?: unknown;
       mimeType?: unknown;
-      name?: unknown;
     };
   } catch {
     return jsonResponse({ ok: false, error: 'Invalid JSON body' }, 400);
+  }
+
+  if (body.mode === 'sign') {
+    const signed = signCloudinaryFolderUpload(creds);
+    return jsonResponse({
+      ok: true,
+      mode: 'signed',
+      cloudName: creds.cloudName,
+      apiKey: creds.apiKey,
+      timestamp: signed.timestamp,
+      folder: signed.folder,
+      signature: signed.signature,
+    });
   }
 
   const rawBase64 =
@@ -185,78 +270,23 @@ export default async (req: Request): Promise<Response> => {
     ''
   );
 
-  if (!cleanBase64 || cleanBase64.length > 5_000_000) {
+  if (!cleanBase64 || cleanBase64.length > 4_800_000) {
     return jsonResponse({ ok: false, error: 'Invalid or oversized audio payload' }, 400);
   }
 
-  const cleanName =
-    typeof body.name === 'string' && body.name.trim()
-      ? body.name.trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48)
-      : `voice_${Date.now()}`;
-  const ext = mimeType.includes('mp4')
-    ? 'm4a'
-    : mimeType.includes('ogg')
-    ? 'ogg'
-    : mimeType.includes('mpeg') || mimeType.includes('mp3')
-    ? 'mp3'
-    : 'webm';
-
-  const timestamp = Math.floor(Date.now() / 1000);
-  const folder = 'notepad_voice';
-  const toSign = `folder=${folder}&timestamp=${timestamp}${creds.apiSecret}`;
-  const signature = createHash('sha1').update(toSign).digest('hex');
-
-  const binary = Buffer.from(cleanBase64, 'base64');
-  const form = new FormData();
-  form.append('file', new Blob([binary], { type: mimeType }), `${cleanName}.${ext}`);
-  form.append('api_key', creds.apiKey);
-  form.append('timestamp', String(timestamp));
-  form.append('folder', folder);
-  form.append('signature', signature);
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 25_000);
-  try {
-    const uploadRes = await fetch(
-      `https://api.cloudinary.com/v1_1/${encodeURIComponent(creds.cloudName)}/video/upload`,
-      {
-        method: 'POST',
-        body: form,
-        signal: controller.signal,
-      }
-    );
-    const uploadJson = (await uploadRes.json().catch(() => ({}))) as {
-      secure_url?: string;
-      error?: { message?: string };
-    };
-    if (!uploadRes.ok || !uploadJson.secure_url) {
-      return jsonResponse(
-        {
-          ok: false,
-          error: uploadJson.error?.message || `cloudinary_http_${uploadRes.status}`,
-        },
-        502
-      );
-    }
-
-    // Serve as lightweight 24kbps MP3 so both iOS Safari and Android Chrome play cleanly
-    const playableUrl = uploadJson.secure_url
-      .replace('/video/upload/', '/video/upload/f_mp3,br_24k/')
-      .replace(/\.[a-z0-9]+$/i, '.mp3');
-
-    return jsonResponse({
-      ok: true,
-      url: playableUrl,
-    });
-  } catch (err: unknown) {
-    return jsonResponse(
-      {
-        ok: false,
-        error: err instanceof Error ? err.message : 'voice_upload_unavailable',
-      },
-      502
-    );
-  } finally {
-    clearTimeout(timer);
+  const dataUri = `data:${mimeType};base64,${cleanBase64}`;
+  const videoAttempt = await uploadAudioToCloudinary(creds, 'video', dataUri);
+  if (videoAttempt.ok) {
+    return jsonResponse({ ok: true, url: videoAttempt.url });
   }
+
+  // Fallback to raw resource type if Cloudinary rejected container transcoding
+  if (videoAttempt.status === 400) {
+    const rawAttempt = await uploadAudioToCloudinary(creds, 'raw', dataUri);
+    if (rawAttempt.ok) {
+      return jsonResponse({ ok: true, url: rawAttempt.url });
+    }
+  }
+
+  return jsonResponse({ ok: false, error: videoAttempt.error }, 502);
 };

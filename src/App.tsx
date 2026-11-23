@@ -250,11 +250,14 @@ export default function App() {
   const activeChatPeerRef = useRef<string | null>(activeChatPeerId);
   const notificationsEnabledRef = useRef<boolean>(notificationsEnabled);
   const messagesMutedRef = useRef<boolean>(messagesMuted);
+  const pushTokenReadyRef = useRef<boolean>(pushTokenReady);
+  const lastFcmSyncAtRef = useRef<number>(0);
 
   screenRef.current = screen;
   activeChatPeerRef.current = activeChatPeerId;
   notificationsEnabledRef.current = notificationsEnabled;
   messagesMutedRef.current = messagesMuted;
+  pushTokenReadyRef.current = pushTokenReady;
 
   const [isCompactViewport, setIsCompactViewport] = useState<boolean>(() =>
     typeof window !== 'undefined' ? window.innerWidth < 768 : false
@@ -314,9 +317,13 @@ export default function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem(MESSENGER_CONVS_KEY, JSON.stringify(conversations));
+      const compactConvs: Record<string, DirectMessage[]> = {};
+      for (const [dmId, msgs] of Object.entries(conversations)) {
+        compactConvs[dmId] = msgs.length > 100 ? msgs.slice(-100) : msgs;
+      }
+      localStorage.setItem(MESSENGER_CONVS_KEY, JSON.stringify(compactConvs));
     } catch {
-      // Ignore
+      // Ignore storage quota errors
     }
   }, [conversations]);
 
@@ -422,14 +429,22 @@ export default function App() {
     messageId?: string,
     shownInSw = false
   ) => {
+    const isAppVisible = document.visibilityState === 'visible';
+
     if (!forceTest) {
       const isViewingSenderChat =
-        document.visibilityState === 'visible' &&
+        isAppVisible &&
         screenRef.current.type === 'messenger' &&
         Boolean(activeChatPeerRef.current) &&
         (!fromPeerId || activeChatPeerRef.current === fromPeerId);
       if (isViewingSenderChat) {
         if (messageId) markMessageNotifiedInSw(messageId);
+        return;
+      }
+
+      // While app is hidden/closing, let Service Worker + FCM Web Push deliver the OS notification.
+      // Never mark messageId in SW while hidden, otherwise the SW will drop the incoming Web Push!
+      if (!isAppVisible && !shownInSw && pushTokenReadyRef.current) {
         return;
       }
 
@@ -442,7 +457,9 @@ export default function App() {
           const first = notifiedMsgIdsRef.current.values().next().value;
           if (first) notifiedMsgIdsRef.current.delete(first);
         }
-        markMessageNotifiedInSw(messageId);
+        if (isAppVisible) {
+          markMessageNotifiedInSw(messageId);
+        }
       } else {
         const now = Date.now();
         if (now - lastReminderAtRef.current < 3500) {
@@ -457,7 +474,7 @@ export default function App() {
       return;
     }
 
-    if (!messagesMutedRef.current) {
+    if (isAppVisible && !messagesMutedRef.current) {
       playReminderChime();
     }
 
@@ -471,9 +488,15 @@ export default function App() {
         body: 'You have a new note reminder',
         icon: '/pwa-192x192.png',
         badge: '/pwa-192x192.png',
-        tag: messageId ? `notepad-msg-${messageId}` : 'notepad-reminder',
+        tag: messageId ? `notepad-msg-${messageId}` : `notepad-reminder-${Date.now()}`,
         silent: isMuted,
       };
+      if (!isAppVisible && 'serviceWorker' in navigator) {
+        void navigator.serviceWorker.ready
+          .then((reg) => reg.showNotification('NotePad', options))
+          .catch(() => {});
+        return;
+      }
       try {
         new Notification('NotePad', options);
       } catch {
@@ -723,7 +746,7 @@ export default function App() {
     };
   }, []);
 
-  // Ensure FCM background push token is registered & saved as soon as Firebase + permission are both ready
+  // Ensure FCM background push token stays registered & auto-heals across SW updates and re-opens
   useEffect(() => {
     if (firebaseStatus !== 'ready' || !auth?.currentUser) return;
     if (typeof Notification === 'undefined' || Notification.permission !== 'granted') {
@@ -732,12 +755,20 @@ export default function App() {
     const uid = auth.currentUser.uid;
     if (fcmTokenSavedRef.current === uid) {
       setPushTokenReady(true);
-      return;
     }
 
     let cancelled = false;
-    const tryRegisterFcm = () => {
-      if (cancelled || fcmTokenSavedRef.current === uid) return;
+    const syncFcmToken = (force = false) => {
+      if (cancelled || !navigator.onLine) return;
+      const now = Date.now();
+      if (
+        !force &&
+        fcmTokenSavedRef.current === uid &&
+        now - lastFcmSyncAtRef.current < 120_000
+      ) {
+        return;
+      }
+      lastFcmSyncAtRef.current = now;
       void registerFirebasePushNotifications(uid).then((res) => {
         if (!cancelled && res.token) {
           fcmTokenSavedRef.current = uid;
@@ -746,15 +777,50 @@ export default function App() {
       });
     };
 
-    tryRegisterFcm();
-    const retryTimer = window.setTimeout(tryRegisterFcm, 3000);
-    window.addEventListener('focus', tryRegisterFcm);
-    window.addEventListener('online', tryRegisterFcm);
+    const handleVisibleSync = () => {
+      if (document.visibilityState === 'visible') {
+        syncFcmToken(false);
+      }
+    };
+
+    const handleSwControllerChange = () => {
+      syncFcmToken(true);
+    };
+
+    const handleFocusOrShow = () => syncFcmToken(false);
+    const handleOnlineSync = () => syncFcmToken(true);
+
+    syncFcmToken(fcmTokenSavedRef.current !== uid);
+    const retryTimer = window.setTimeout(() => {
+      if (fcmTokenSavedRef.current !== uid) {
+        syncFcmToken(true);
+      }
+    }, 3000);
+
+    window.addEventListener('focus', handleFocusOrShow);
+    window.addEventListener('pageshow', handleFocusOrShow);
+    window.addEventListener('online', handleOnlineSync);
+    document.addEventListener('visibilitychange', handleVisibleSync);
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.addEventListener(
+        'controllerchange',
+        handleSwControllerChange
+      );
+    }
+
     return () => {
       cancelled = true;
       window.clearTimeout(retryTimer);
-      window.removeEventListener('focus', tryRegisterFcm);
-      window.removeEventListener('online', tryRegisterFcm);
+      window.removeEventListener('focus', handleFocusOrShow);
+      window.removeEventListener('pageshow', handleFocusOrShow);
+      window.removeEventListener('online', handleOnlineSync);
+      document.removeEventListener('visibilitychange', handleVisibleSync);
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.removeEventListener(
+          'controllerchange',
+          handleSwControllerChange
+        );
+      }
     };
   }, [firebaseStatus, notificationsEnabled]);
 
