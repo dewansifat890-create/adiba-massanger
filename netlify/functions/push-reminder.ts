@@ -1,48 +1,103 @@
-import {
-  App,
-  cert,
-  getApps,
-  initializeApp,
-  ServiceAccount,
-} from 'firebase-admin/app';
-import { getAuth as getAdminAuth } from 'firebase-admin/auth';
-import { getFirestore as getAdminFirestore } from 'firebase-admin/firestore';
-import { getMessaging as getAdminMessaging } from 'firebase-admin/messaging';
+import { createSign, createVerify } from 'node:crypto';
+
+interface ServiceAccountCreds {
+  projectId: string;
+  clientEmail: string;
+  privateKey: string;
+}
+
+interface CachedAccessToken {
+  token: string;
+  expiresAt: number;
+  cacheKey: string;
+}
+
+interface CachedCerts {
+  certs: Record<string, string>;
+  expiresAt: number;
+}
+
+const GOOGLE_CERTS_URL =
+  'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com';
+const OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const OAUTH_SCOPES = [
+  'https://www.googleapis.com/auth/datastore',
+  'https://www.googleapis.com/auth/firebase.messaging',
+].join(' ');
+
+let cachedAccessToken: CachedAccessToken | null = null;
+let cachedCerts: CachedCerts | null = null;
 
 function makeDmId(userA: string, userB: string): string {
   return [userA, userB].sort().join('__');
 }
 
+const CORS_HEADERS: Record<string, string> = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: {
+      ...CORS_HEADERS,
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-store',
     },
   });
 }
 
-function parseServiceAccount(): ServiceAccount | null {
-  const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT?.trim();
+function base64UrlEncode(input: Buffer | string): string {
+  const buf = typeof input === 'string' ? Buffer.from(input, 'utf8') : input;
+  return buf.toString('base64url');
+}
+
+function base64UrlDecodeJson<T>(segment: string): T | null {
+  try {
+    const raw = Buffer.from(segment, 'base64url').toString('utf8');
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+function parseServiceAccount(): ServiceAccountCreds | null {
+  let rawJson = process.env.FIREBASE_SERVICE_ACCOUNT?.trim() || '';
+  if (
+    (rawJson.startsWith("'") && rawJson.endsWith("'")) ||
+    (rawJson.startsWith('"') && rawJson.endsWith('"') && !rawJson.startsWith('{"'))
+  ) {
+    rawJson = rawJson.slice(1, -1).trim();
+  }
+
   if (rawJson) {
     try {
       const parsed = (
         rawJson.startsWith('{')
           ? JSON.parse(rawJson)
           : JSON.parse(Buffer.from(rawJson, 'base64').toString('utf8'))
-      ) as ServiceAccount & { private_key?: string; project_id?: string; client_email?: string };
+      ) as {
+        privateKey?: string;
+        private_key?: string;
+        clientEmail?: string;
+        client_email?: string;
+        projectId?: string;
+        project_id?: string;
+      };
 
       const privateKey = (parsed.privateKey || parsed.private_key || '').replace(
         /\\n/g,
         '\n'
       );
-      const clientEmail = parsed.clientEmail || parsed.client_email || '';
-      const projectId =
+      const clientEmail = (parsed.clientEmail || parsed.client_email || '').trim();
+      const projectId = (
         parsed.projectId ||
         parsed.project_id ||
         process.env.VITE_FIREBASE_PROJECT_ID ||
-        'adiba-massanger';
+        'adiba-massanger'
+      ).trim();
 
       if (privateKey && clientEmail && projectId) {
         return { projectId, clientEmail, privateKey };
@@ -52,10 +107,11 @@ function parseServiceAccount(): ServiceAccount | null {
     }
   }
 
-  const projectId =
+  const projectId = (
     process.env.FIREBASE_PROJECT_ID ||
     process.env.VITE_FIREBASE_PROJECT_ID ||
-    'adiba-massanger';
+    'adiba-massanger'
+  ).trim();
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL?.trim() || '';
   const privateKey = (process.env.FIREBASE_PRIVATE_KEY || '').replace(
     /\\n/g,
@@ -68,32 +124,234 @@ function parseServiceAccount(): ServiceAccount | null {
   return null;
 }
 
-function getOrInitAdminApp(): { app: App | null; missingCredentials: boolean } {
-  const appName = 'netlify-push-admin';
-  const existing = getApps().find((a) => a.name === appName);
-  if (existing) {
-    return { app: existing, missingCredentials: false };
+async function getGoogleCerts(forceRefresh = false): Promise<Record<string, string>> {
+  const now = Date.now();
+  if (!forceRefresh && cachedCerts && cachedCerts.expiresAt > now) {
+    return cachedCerts.certs;
   }
 
-  const sa = parseServiceAccount();
-  if (!sa) {
-    return { app: null, missingCredentials: true };
+  const res = await fetch(GOOGLE_CERTS_URL);
+  if (!res.ok) {
+    throw new Error(`Failed to load Google public certs: ${res.status}`);
+  }
+  const certs = (await res.json()) as Record<string, string>;
+  const cc = res.headers.get('cache-control') || '';
+  const maxAgeMatch = cc.match(/max-age=(\d+)/i);
+  const ttlMs = maxAgeMatch ? Number(maxAgeMatch[1]) * 1000 : 3600 * 1000;
+  cachedCerts = {
+    certs,
+    expiresAt: now + Math.max(60_000, ttlMs),
+  };
+  return certs;
+}
+
+async function verifyFirebaseIdToken(
+  idToken: string,
+  projectId: string
+): Promise<string> {
+  const parts = idToken.split('.');
+  if (parts.length !== 3) {
+    throw new Error('Malformed JWT');
+  }
+  const [headerB64, payloadB64, sigB64] = parts;
+
+  const header = base64UrlDecodeJson<{ alg?: string; kid?: string }>(headerB64);
+  const payload = base64UrlDecodeJson<{
+    aud?: string;
+    iss?: string;
+    sub?: string;
+    exp?: number;
+    iat?: number;
+    auth_time?: number;
+  }>(payloadB64);
+
+  if (!header || !payload) {
+    throw new Error('Invalid JWT JSON');
+  }
+  if (header.alg !== 'RS256' || typeof header.kid !== 'string' || !header.kid) {
+    throw new Error('Unsupported JWT algorithm or missing kid');
   }
 
-  const app = initializeApp({ credential: cert(sa) }, appName);
-  return { app, missingCredentials: false };
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (payload.aud !== projectId) {
+    throw new Error('JWT audience mismatch');
+  }
+  if (payload.iss !== `https://securetoken.google.com/${projectId}`) {
+    throw new Error('JWT issuer mismatch');
+  }
+  if (
+    typeof payload.sub !== 'string' ||
+    payload.sub.length === 0 ||
+    payload.sub.length > 128
+  ) {
+    throw new Error('Invalid JWT subject');
+  }
+  if (typeof payload.exp !== 'number' || payload.exp <= nowSec) {
+    throw new Error('JWT expired');
+  }
+  if (typeof payload.iat !== 'number' || payload.iat > nowSec + 300) {
+    throw new Error('JWT issued in future');
+  }
+  if (typeof payload.auth_time !== 'number' || payload.auth_time > nowSec + 300) {
+    throw new Error('Invalid auth_time');
+  }
+
+  let certs = await getGoogleCerts(false);
+  let certPem = certs[header.kid];
+  if (!certPem) {
+    certs = await getGoogleCerts(true);
+    certPem = certs[header.kid];
+  }
+  if (!certPem) {
+    throw new Error('Unknown signing key');
+  }
+
+  const verifier = createVerify('RSA-SHA256');
+  verifier.update(`${headerB64}.${payloadB64}`);
+  verifier.end();
+  const sigBuf = Buffer.from(sigB64, 'base64url');
+  if (!verifier.verify(certPem, sigBuf)) {
+    throw new Error('Invalid JWT signature');
+  }
+
+  return payload.sub;
+}
+
+async function getGoogleAccessToken(sa: ServiceAccountCreds): Promise<string> {
+  const now = Date.now();
+  const cacheKey = `${sa.projectId}:${sa.clientEmail}`;
+  if (
+    cachedAccessToken &&
+    cachedAccessToken.cacheKey === cacheKey &&
+    cachedAccessToken.expiresAt > now + 60_000
+  ) {
+    return cachedAccessToken.token;
+  }
+
+  const iat = Math.floor(now / 1000);
+  const exp = iat + 3600;
+  const headerSegment = base64UrlEncode(
+    JSON.stringify({ alg: 'RS256', typ: 'JWT' })
+  );
+  const claimSegment = base64UrlEncode(
+    JSON.stringify({
+      iss: sa.clientEmail,
+      scope: OAUTH_SCOPES,
+      aud: OAUTH_TOKEN_URL,
+      iat,
+      exp,
+    })
+  );
+  const signingInput = `${headerSegment}.${claimSegment}`;
+  const signer = createSign('RSA-SHA256');
+  signer.update(signingInput);
+  signer.end();
+  const signature = base64UrlEncode(signer.sign(sa.privateKey));
+  const assertion = `${signingInput}.${signature}`;
+
+  const body = new URLSearchParams({
+    grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+    assertion,
+  });
+
+  const tokenRes = await fetch(OAUTH_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+
+  if (!tokenRes.ok) {
+    const errText = await tokenRes.text().catch(() => '');
+    throw new Error(`OAuth token exchange failed (${tokenRes.status}): ${errText}`);
+  }
+
+  const tokenJson = (await tokenRes.json()) as {
+    access_token?: string;
+    expires_in?: number;
+  };
+  if (!tokenJson.access_token) {
+    throw new Error('Missing access_token in OAuth response');
+  }
+
+  const ttlMs = (tokenJson.expires_in ?? 3600) * 1000;
+  cachedAccessToken = {
+    token: tokenJson.access_token,
+    expiresAt: now + ttlMs,
+    cacheKey,
+  };
+  return tokenJson.access_token;
+}
+
+interface FirestoreDocResponse {
+  fields?: Record<
+    string,
+    {
+      stringValue?: string;
+      nullValue?: null;
+      arrayValue?: {
+        values?: Array<{ stringValue?: string }>;
+      };
+    }
+  >;
+}
+
+async function getFirestoreDoc(
+  projectId: string,
+  accessToken: string,
+  docPath: string
+): Promise<FirestoreDocResponse | null> {
+  const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+    projectId
+  )}/databases/(default)/documents/${docPath}`;
+
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (res.status === 404) {
+    return null;
+  }
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`Firestore read failed (${res.status}): ${errText}`);
+  }
+  return (await res.json()) as FirestoreDocResponse;
+}
+
+async function clearUserFcmToken(
+  projectId: string,
+  accessToken: string,
+  userId: string
+): Promise<void> {
+  const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+    projectId
+  )}/databases/(default)/documents/users/${encodeURIComponent(
+    userId
+  )}?updateMask.fieldPaths=fcmToken`;
+
+  await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      fields: {
+        fcmToken: { nullValue: null },
+      },
+    }),
+  });
 }
 
 export default async (req: Request): Promise<Response> => {
   if (req.method === 'OPTIONS') {
-    return new Response(null, { status: 204 });
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
   if (req.method !== 'POST') {
     return jsonResponse({ ok: false, error: 'Method not allowed' }, 405);
   }
 
-  const { app: adminApp, missingCredentials } = getOrInitAdminApp();
-  if (!adminApp || missingCredentials) {
+  const sa = parseServiceAccount();
+  if (!sa) {
     return jsonResponse({
       ok: true,
       pushed: false,
@@ -111,8 +369,7 @@ export default async (req: Request): Promise<Response> => {
 
   let callerUid = '';
   try {
-    const decoded = await getAdminAuth(adminApp).verifyIdToken(token);
-    callerUid = decoded.uid;
+    callerUid = await verifyFirebaseIdToken(token, sa.projectId);
   } catch {
     return jsonResponse({ ok: false, error: 'Invalid auth token' }, 401);
   }
@@ -131,79 +388,127 @@ export default async (req: Request): Promise<Response> => {
   }
 
   try {
-    const adminDb = getAdminFirestore(adminApp);
+    const accessToken = await getGoogleAccessToken(sa);
     const chatId = makeDmId(callerUid, toUserId);
-    const chatDoc = await adminDb.collection('chats').doc(chatId).get();
-    if (!chatDoc.exists) {
+
+    const chatDoc = await getFirestoreDoc(
+      sa.projectId,
+      accessToken,
+      `chats/${encodeURIComponent(chatId)}`
+    );
+    if (!chatDoc) {
       return jsonResponse({ ok: false, error: 'Not a participant' }, 403);
     }
-    const participants = chatDoc.data()?.participants;
-    if (
-      !Array.isArray(participants) ||
-      !participants.includes(callerUid) ||
-      !participants.includes(toUserId)
-    ) {
+
+    const participantValues =
+      chatDoc.fields?.participants?.arrayValue?.values || [];
+    const participants = participantValues
+      .map((v) => v.stringValue)
+      .filter((v): v is string => typeof v === 'string');
+
+    if (!participants.includes(callerUid) || !participants.includes(toUserId)) {
       return jsonResponse({ ok: false, error: 'Access denied' }, 403);
     }
 
-    const recipientDoc = await adminDb.collection('users').doc(toUserId).get();
-    const fcmToken = recipientDoc.data()?.fcmToken;
+    const recipientDoc = await getFirestoreDoc(
+      sa.projectId,
+      accessToken,
+      `users/${encodeURIComponent(toUserId)}`
+    );
+    const fcmToken = recipientDoc?.fields?.fcmToken?.stringValue;
     if (typeof fcmToken !== 'string' || !fcmToken) {
       return jsonResponse({ ok: true, pushed: false, reason: 'no_fcm_token' });
     }
 
     const tagId = `notepad-reminder-${Date.now()}`;
-    await getAdminMessaging(adminApp).send({
-      token: fcmToken,
-      notification: {
-        title: 'NotePad',
-        body: 'You have a new note reminder',
+    const fcmUrl = `https://fcm.googleapis.com/v1/projects/${encodeURIComponent(
+      sa.projectId
+    )}/messages:send`;
+
+    const fcmRes = await fetch(fcmUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
       },
-      data: {
-        title: 'NotePad',
-        body: 'You have a new note reminder',
-        url: '/',
-      },
-      webpush: {
-        headers: {
-          Urgency: 'high',
-          TTL: '86400',
+      body: JSON.stringify({
+        message: {
+          token: fcmToken,
+          notification: {
+            title: 'NotePad',
+            body: 'You have a new note reminder',
+          },
+          data: {
+            title: 'NotePad',
+            body: 'You have a new note reminder',
+            url: '/',
+          },
+          android: {
+            priority: 'HIGH',
+            ttl: '86400s',
+            notification: {
+              title: 'NotePad',
+              body: 'You have a new note reminder',
+              sound: 'default',
+              default_sound: true,
+              notification_priority: 'PRIORITY_HIGH',
+              visibility: 'PUBLIC',
+              tag: tagId,
+            },
+          },
+          webpush: {
+            headers: {
+              Urgency: 'high',
+              TTL: '86400',
+            },
+            notification: {
+              title: 'NotePad',
+              body: 'You have a new note reminder',
+              icon: '/pwa-192x192.png',
+              badge: '/pwa-192x192.png',
+              tag: tagId,
+              renotify: true,
+            },
+            fcm_options: {
+              link: '/',
+            },
+          },
         },
-        notification: {
-          title: 'NotePad',
-          body: 'You have a new note reminder',
-          icon: '/pwa-192x192.png',
-          badge: '/pwa-192x192.png',
-          tag: tagId,
-          renotify: true,
-        },
-        fcmOptions: {
-          link: '/',
-        },
-      },
+      }),
     });
 
-    return jsonResponse({ ok: true, pushed: true });
-  } catch (err: unknown) {
-    const errCode =
-      typeof err === 'object' && err !== null && 'code' in err
-        ? String((err as { code: unknown }).code)
-        : 'push_unavailable';
-
-    if (
-      errCode === 'messaging/registration-token-not-registered' ||
-      errCode === 'messaging/invalid-registration-token'
-    ) {
-      try {
-        await getAdminFirestore(adminApp)
-          .collection('users')
-          .doc(toUserId)
-          .set({ fcmToken: null }, { merge: true });
-      } catch {
-        // Ignore cleanup error
-      }
+    if (fcmRes.ok) {
+      return jsonResponse({ ok: true, pushed: true });
     }
-    console.warn('Netlify FCM reminder send skipped:', errCode);
-    return jsonResponse({ ok: true, pushed: false, reason: errCode });
+
+    const errJson = (await fcmRes.json().catch(() => ({}))) as {
+      error?: {
+        status?: string;
+        message?: string;
+        details?: Array<{ errorCode?: string }>;
+      };
+    };
+    const fcmErrorCode =
+      errJson.error?.details?.find((d) => d.errorCode)?.errorCode ||
+      errJson.error?.status ||
+      `fcm_http_${fcmRes.status}`;
+
+    const isInvalidToken =
+      fcmErrorCode === 'UNREGISTERED' ||
+      (fcmErrorCode === 'INVALID_ARGUMENT' &&
+        (errJson.error?.message || '').toLowerCase().includes('registration token'));
+
+    if (isInvalidToken) {
+      await clearUserFcmToken(sa.projectId, accessToken, toUserId).catch(
+        () => {}
+      );
+    }
+
+    console.warn('Netlify FCM reminder send skipped:', fcmErrorCode);
+    return jsonResponse({ ok: true, pushed: false, reason: fcmErrorCode });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'push_unavailable';
+    console.warn('Netlify push-reminder error:', message);
+    return jsonResponse({ ok: true, pushed: false, reason: 'push_unavailable' });
   }
 };
